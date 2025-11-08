@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "openwrt": {
+      "command": "node",
+      "args": ["E:\\OpenWRT\\mcp\\build\\index.js"],
+      "env": {
+        "OPENWRT_HOST": "192.168.1.1",
+        "OPENWRT_PORT": "22",
+        "OPENWRT_USERNAME": "root",
+        "OPENWRT_PASSWORD": "your_password_here"
+      }
+    }
+  }
+}
