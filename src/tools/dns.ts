@@ -55,7 +55,6 @@ export const dnsTools: Tool[] = [
 
       // Add new DNS servers
       for (const server of servers) {
-        const command = `uci add_list dhcp.@dnsmasq[0].server='${server}'`;
         await client.uciAddSection("dhcp", "@dnsmasq[0]", "dnsmasq");
       }
 

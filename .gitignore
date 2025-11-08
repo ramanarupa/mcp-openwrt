@@ -35,5 +35,4 @@ id_rsa*
 /package-lock.json
 /CLAUDE.md
 
-.mcp.json
 /.claude/

@@ -187,7 +187,7 @@ export class OpenWRTClient {
    */
   async writeFile(path: string, content: string): Promise<void> {
     // Escape single quotes in content
-    const escapedContent = content.replace(/'/g, "'\\''");
+    content.replace(/'/g, "'\\''");
     // Use cat with heredoc for reliable multi-line content
     const command = `cat > ${path} << 'EOFMCP'\n${content}\nEOFMCP`;
     await this.executeCommand(command);

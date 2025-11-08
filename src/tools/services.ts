@@ -42,7 +42,7 @@ export const serviceTools: Tool[] = [
       required: ["name", "script_content"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
-      const { name, script_content, start_priority, stop_priority, enable } = args;
+      const { name, script_content, enable } = args;
 
       try {
         const servicePath = `/etc/init.d/${name}`;

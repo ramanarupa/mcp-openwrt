@@ -62,8 +62,7 @@ export const resources: Resource[] = [
     handler: async (client: OpenWRTClient) => {
       try {
         // Try to read network config and filter WireGuard interfaces
-        const networkConfig = await client.readFile("/etc/config/network");
-        return networkConfig;
+        return await client.readFile("/etc/config/network");
       } catch (error) {
         return "WireGuard configuration not found or not configured";
       }
