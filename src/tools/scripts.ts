@@ -1,15 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
-
-export interface Tool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, any>;
-    required?: string[];
-  };
-  handler: (client: OpenWRTClient, args: Record<string, any>) => Promise<any>;
-}
+import { Tool } from "../types.js";
+import { shellQuote } from "../utils.js";
 
 export const scriptTools: Tool[] = [
   {
@@ -50,34 +41,27 @@ export const scriptTools: Tool[] = [
         shebang = "#!/bin/sh",
       } = args;
 
-      try {
-        const scriptPath = `${directory}/${name}`;
+      const scriptPath = `${directory}/${name}`;
 
-        // Add shebang if not present
-        const fullContent = content.startsWith("#!")
-          ? content
-          : `${shebang}\n\n${content}`;
+      // Add shebang if not present
+      const fullContent = content.startsWith("#!")
+        ? content
+        : `${shebang}\n\n${content}`;
 
-        // Write script
-        await client.writeFile(scriptPath, fullContent);
+      // Write script
+      await client.writeFile(scriptPath, fullContent);
 
-        // Make executable if requested
-        if (executable) {
-          await client.executeCommand(`chmod +x ${scriptPath}`);
-        }
-
-        return {
-          success: true,
-          message: `Script created successfully: ${scriptPath}`,
-          path: scriptPath,
-          executable,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
+      // Make executable if requested
+      if (executable) {
+        await client.executeCommand(`chmod +x ${shellQuote(scriptPath)}`);
       }
+
+      return {
+        success: true,
+        message: `Script created successfully: ${scriptPath}`,
+        path: scriptPath,
+        executable,
+      };
     },
   },
   {
@@ -104,21 +88,17 @@ export const scriptTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, args: scriptArgs = "", background = false } = args;
 
-      try {
-        const command = background ? `${path} ${scriptArgs} &` : `${path} ${scriptArgs}`;
-        const output = await client.executeCommand(command);
+      // path is quoted; scriptArgs is intentionally raw (user-supplied shell args)
+      const command = background
+        ? `${shellQuote(path)} ${scriptArgs} &`
+        : `${shellQuote(path)} ${scriptArgs}`;
+      const output = await client.executeCommand(command);
 
-        return {
-          success: true,
-          output,
-          background,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        output,
+        background,
+      };
     },
   },
   {
@@ -181,26 +161,19 @@ else
 fi
 `;
 
-      try {
-        const scriptPath = `/root/${name}`;
-        await client.writeFile(scriptPath, scriptContent);
-        await client.executeCommand(`chmod +x ${scriptPath}`);
+      const scriptPath = `/root/${name}`;
+      await client.writeFile(scriptPath, scriptContent);
+      await client.executeCommand(`chmod +x ${shellQuote(scriptPath)}`);
 
-        // Create destination directory
-        await client.executeCommand(`mkdir -p ${destination}`);
+      // Create destination directory
+      await client.executeCommand(`mkdir -p ${shellQuote(destination)}`);
 
-        return {
-          success: true,
-          message: `Backup script created: ${scriptPath}`,
-          path: scriptPath,
-          script: scriptContent,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `Backup script created: ${scriptPath}`,
+        path: scriptPath,
+        script: scriptContent,
+      };
     },
   },
   {
@@ -274,24 +247,17 @@ fi
 echo "$(date): CPU=$CPU_LOAD MEM=$MEM_USAGE% DISK=$DISK_USAGE%" >> $LOG_FILE
 `;
 
-      try {
-        const scriptPath = `/root/${name}`;
-        await client.writeFile(scriptPath, scriptContent);
-        await client.executeCommand(`chmod +x ${scriptPath}`);
+      const scriptPath = `/root/${name}`;
+      await client.writeFile(scriptPath, scriptContent);
+      await client.executeCommand(`chmod +x ${shellQuote(scriptPath)}`);
 
-        return {
-          success: true,
-          message: `Monitor script created: ${scriptPath}`,
-          path: scriptPath,
-          script: scriptContent,
-          note: "You can add this script to crontab to run periodically",
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `Monitor script created: ${scriptPath}`,
+        path: scriptPath,
+        script: scriptContent,
+        note: "You can add this script to crontab to run periodically",
+      };
     },
   },
   {
@@ -314,7 +280,9 @@ echo "$(date): CPU=$CPU_LOAD MEM=$MEM_USAGE% DISK=$DISK_USAGE%" >> $LOG_FILE
       const { directory = "/root", pattern = "*.sh" } = args;
 
       try {
-        const output = await client.executeCommand(`ls -lh ${directory}/${pattern} 2>/dev/null`);
+        const output = await client.executeCommand(
+          `find ${shellQuote(directory)} -maxdepth 1 -name ${shellQuote(pattern)} -exec ls -lh {} +`
+        );
 
         return {
           success: true,

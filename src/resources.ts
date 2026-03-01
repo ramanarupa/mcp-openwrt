@@ -57,12 +57,26 @@ export const resources: Resource[] = [
   {
     uri: "openwrt://config/wireguard",
     name: "WireGuard Configuration",
-    description: "WireGuard VPN configuration",
+    description: "WireGuard VPN configuration (UCI entries and runtime status)",
     mimeType: "text/plain",
     handler: async (client: OpenWRTClient) => {
       try {
-        // Try to read network config and filter WireGuard interfaces
-        return await client.readFile("/etc/config/network");
+        const uciConfig = await client.uciShow("network");
+        const wgLines = uciConfig
+          .split("\n")
+          .filter((line) => line.includes("wireguard") || /^network\.wg\d+\./.test(line));
+
+        let result = "=== UCI WireGuard Config ===\n";
+        result += wgLines.length > 0 ? wgLines.join("\n") : "No WireGuard UCI configuration found";
+
+        try {
+          const wgStatus = await client.executeCommand("wg show all");
+          result += "\n\n=== WireGuard Runtime Status ===\n" + wgStatus;
+        } catch (error) {
+          result += "\n\n=== WireGuard Runtime Status ===\nNo active WireGuard interfaces";
+        }
+
+        return result;
       } catch (error) {
         return "WireGuard configuration not found or not configured";
       }

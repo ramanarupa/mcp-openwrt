@@ -1,15 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
-
-export interface Tool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, any>;
-    required?: string[];
-  };
-  handler: (client: OpenWRTClient, args: Record<string, any>) => Promise<any>;
-}
+import { Tool } from "../types.js";
+import { shellQuote, validateMode, uniqueHeredocDelimiter } from "../utils.js";
 
 export const fileTools: Tool[] = [
   {
@@ -27,20 +18,12 @@ export const fileTools: Tool[] = [
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path } = args;
-
-      try {
-        const content = await client.readFile(path);
-        return {
-          success: true,
-          path,
-          content,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      const content = await client.readFile(path);
+      return {
+        success: true,
+        path,
+        content,
+      };
     },
   },
   {
@@ -67,24 +50,18 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, content, mode } = args;
 
-      try {
-        await client.writeFile(path, content);
+      await client.writeFile(path, content);
 
-        if (mode) {
-          await client.executeCommand(`chmod ${mode} ${path}`);
-        }
-
-        return {
-          success: true,
-          message: `File written successfully: ${path}`,
-          path,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
+      if (mode) {
+        validateMode(mode);
+        await client.executeCommand(`chmod ${mode} ${shellQuote(path)}`);
       }
+
+      return {
+        success: true,
+        message: `File written successfully: ${path}`,
+        path,
+      };
     },
   },
   {
@@ -107,21 +84,13 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, content } = args;
 
-      try {
-        // Escape single quotes in content
-        const escapedContent = content.replace(/'/g, "'\\''");
-        await client.executeCommand(`echo '${escapedContent}' >> ${path}`);
+      const delimiter = uniqueHeredocDelimiter(content);
+      await client.executeCommand(`cat >> ${shellQuote(path)} << '${delimiter}'\n${content}\n${delimiter}`);
 
-        return {
-          success: true,
-          message: `Content appended to ${path}`,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `Content appended to ${path}`,
+      };
     },
   },
   {
@@ -151,18 +120,11 @@ export const fileTools: Tool[] = [
         };
       }
 
-      try {
-        await client.executeCommand(`rm -f ${path}`);
-        return {
-          success: true,
-          message: `File deleted: ${path}`,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      await client.executeCommand(`rm -f ${shellQuote(path)}`);
+      return {
+        success: true,
+        message: `File deleted: ${path}`,
+      };
     },
   },
   {
@@ -185,21 +147,16 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, detailed } = args;
 
-      try {
-        const command = detailed ? `ls -lah ${path}` : `ls -A ${path}`;
-        const output = await client.executeCommand(command);
+      const command = detailed
+        ? `ls -lah ${shellQuote(path)}`
+        : `ls -A ${shellQuote(path)}`;
+      const output = await client.executeCommand(command);
 
-        return {
-          success: true,
-          path,
-          listing: output,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        path,
+        listing: output,
+      };
     },
   },
   {
@@ -222,20 +179,15 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, parents } = args;
 
-      try {
-        const command = parents ? `mkdir -p ${path}` : `mkdir ${path}`;
-        await client.executeCommand(command);
+      const command = parents
+        ? `mkdir -p ${shellQuote(path)}`
+        : `mkdir ${shellQuote(path)}`;
+      await client.executeCommand(command);
 
-        return {
-          success: true,
-          message: `Directory created: ${path}`,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `Directory created: ${path}`,
+      };
     },
   },
   {
@@ -263,9 +215,11 @@ export const fileTools: Tool[] = [
       const { directory, pattern, file_pattern } = args;
 
       try {
-        let command = `grep -r "${pattern}" ${directory}`;
+        let command: string;
         if (file_pattern) {
-          command = `find ${directory} -name "${file_pattern}" -exec grep -H "${pattern}" {} \\;`;
+          command = `find ${shellQuote(directory)} -name ${shellQuote(file_pattern)} -exec grep -H -F -- ${shellQuote(pattern)} {} \\;`;
+        } else {
+          command = `grep -r -F -- ${shellQuote(pattern)} ${shellQuote(directory)}`;
         }
 
         const output = await client.executeCommand(command);
@@ -277,17 +231,14 @@ export const fileTools: Tool[] = [
       } catch (error) {
         // grep returns non-zero exit code when no matches found
         const errorMsg = error instanceof Error ? error.message : String(error);
-        if (errorMsg.includes("No such file") || errorMsg.includes("not found")) {
+        if (errorMsg.includes("exit code 1") || errorMsg.includes("code 1")) {
           return {
             success: true,
             matches: "",
             message: "No matches found",
           };
         }
-        return {
-          success: false,
-          error: errorMsg,
-        };
+        throw error;
       }
     },
   },
@@ -311,23 +262,16 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, backup_path } = args;
 
-      try {
-        const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-        const destination = backup_path || `${path}.backup-${timestamp}`;
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const destination = backup_path || `${path}.backup-${timestamp}`;
 
-        await client.executeCommand(`cp -r ${path} ${destination}`);
+      await client.executeCommand(`cp -r ${shellQuote(path)} ${shellQuote(destination)}`);
 
-        return {
-          success: true,
-          message: `Backup created: ${destination}`,
-          backup_path: destination,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `Backup created: ${destination}`,
+        backup_path: destination,
+      };
     },
   },
 ];

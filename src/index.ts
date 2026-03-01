@@ -6,10 +6,13 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   ListResourcesRequestSchema,
+  ListResourceTemplatesRequestSchema,
   ReadResourceRequestSchema,
   ListPromptsRequestSchema,
   GetPromptRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import { readFileSync } from "fs";
+import { homedir } from "os";
 import { OpenWRTClient } from "./openwrt-client.js";
 import { networkTools } from "./tools/network.js";
 import { dnsTools } from "./tools/dns.js";
@@ -21,18 +24,37 @@ import { scriptTools } from "./tools/scripts.js";
 import { resources } from "./resources.js";
 import { prompts } from "./prompts.js";
 
+// Read private key from file if path is provided
+let privateKey = process.env.OPENWRT_PRIVATE_KEY;
+if (!privateKey && process.env.OPENWRT_PRIVATE_KEY_FILE) {
+  try {
+    let keyPath = process.env.OPENWRT_PRIVATE_KEY_FILE;
+    if (keyPath.startsWith("~/") || keyPath === "~") {
+      keyPath = keyPath.replace("~", homedir());
+    }
+    const raw = readFileSync(keyPath, "utf-8");
+    const endMarker = "-----END OPENSSH PRIVATE KEY-----";
+    const endIdx = raw.indexOf(endMarker);
+    privateKey = endIdx !== -1 ? raw.slice(0, endIdx + endMarker.length) + "\n" : raw;
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error(`Error: Failed to read private key file: ${msg}`);
+    process.exit(1);
+  }
+}
+
 // Read configuration from environment variables
 const config = {
   host: process.env.OPENWRT_HOST || "192.168.1.1",
   port: parseInt(process.env.OPENWRT_PORT || "22"),
   username: process.env.OPENWRT_USERNAME || "root",
   password: process.env.OPENWRT_PASSWORD,
-  privateKey: process.env.OPENWRT_PRIVATE_KEY,
+  privateKey,
 };
 
 // Validate configuration
 if (!config.password && !config.privateKey) {
-  console.error("Error: Either OPENWRT_PASSWORD or OPENWRT_PRIVATE_KEY must be set");
+  console.error("Error: Either OPENWRT_PASSWORD, OPENWRT_PRIVATE_KEY, or OPENWRT_PRIVATE_KEY_FILE must be set");
   process.exit(1);
 }
 
@@ -121,6 +143,20 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
   };
 });
 
+// Advertise resource templates
+server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => {
+  return {
+    resourceTemplates: [
+      {
+        uriTemplate: "openwrt://file/{+path}",
+        name: "OpenWRT File",
+        description: "Read any file from the OpenWRT filesystem by path",
+        mimeType: "text/plain",
+      },
+    ],
+  };
+});
+
 // Handle resource reading
 server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
   const resourceUri = request.params.uri;
@@ -195,6 +231,20 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     messages,
   };
 });
+
+// Graceful shutdown
+async function shutdown() {
+  console.error("Shutting down...");
+  try {
+    await openwrtClient.disconnect();
+  } catch (error) {
+    // Ignore disconnect errors during shutdown
+  }
+  process.exit(0);
+}
+
+process.on("SIGINT", shutdown);
+process.on("SIGTERM", shutdown);
 
 // Start server
 async function main() {

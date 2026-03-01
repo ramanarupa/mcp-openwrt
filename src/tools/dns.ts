@@ -1,15 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
-
-export interface Tool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, any>;
-    required?: string[];
-  };
-  handler: (client: OpenWRTClient, args: Record<string, any>) => Promise<any>;
-}
+import { Tool } from "../types.js";
+import { shellQuote } from "../utils.js";
 
 export const dnsTools: Tool[] = [
   {
@@ -46,16 +37,16 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const servers = args.servers as string[];
 
-      // Delete existing DNS servers
+      // Delete existing DNS server list
       try {
-        await client.uciSet("dhcp", "dnsmasq", "server", "");
+        await client.executeCommand("uci delete dhcp.@dnsmasq[0].server");
       } catch (error) {
-        // Ignore if doesn't exist
+        // Ignore if list doesn't exist yet
       }
 
-      // Add new DNS servers
+      // Add new DNS servers via list
       for (const server of servers) {
-        await client.uciAddSection("dhcp", "@dnsmasq[0]", "dnsmasq");
+        await client.executeCommand(`uci add_list dhcp.@dnsmasq[0].server=${shellQuote(server)}`);
       }
 
       // Commit and reload

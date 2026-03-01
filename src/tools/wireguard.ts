@@ -1,15 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
-
-export interface Tool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, any>;
-    required?: string[];
-  };
-  handler: (client: OpenWRTClient, args: Record<string, any>) => Promise<any>;
-}
+import { Tool } from "../types.js";
+import { shellQuote, validateName } from "../utils.js";
 
 export const wireguardTools: Tool[] = [
   {
@@ -67,6 +58,8 @@ export const wireguardTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, private_key, listen_port, addresses } = args;
 
+      validateName(name, "interface name");
+
       // Generate private key if not provided
       let privateKey = private_key;
       if (!privateKey) {
@@ -81,8 +74,7 @@ export const wireguardTools: Tool[] = [
 
       // Add IP addresses
       for (const addr of addresses) {
-        const command = `uci add_list network.${name}.addresses='${addr}'`;
-        await client.executeCommand(command);
+        await client.executeCommand(`uci add_list network.${name}.addresses=${shellQuote(addr)}`);
       }
 
       // Commit and reload
@@ -91,7 +83,7 @@ export const wireguardTools: Tool[] = [
 
       // Get public key
       const publicKey = (
-        await client.executeCommand(`echo "${privateKey}" | wg pubkey`)
+        await client.executeCommand(`echo ${shellQuote(privateKey)} | wg pubkey`)
       ).trim();
 
       return {
@@ -155,6 +147,9 @@ export const wireguardTools: Tool[] = [
         preshared_key,
       } = args;
 
+      validateName(iface, "interface name");
+      validateName(peer_name, "peer name");
+
       // Create peer section
       const peerSection = `${iface}_${peer_name}`;
       await client.uciAddSection("network", peerSection, "wireguard_" + iface);
@@ -162,14 +157,16 @@ export const wireguardTools: Tool[] = [
 
       // Add allowed IPs
       for (const ip of allowed_ips) {
-        const command = `uci add_list network.${peerSection}.allowed_ips='${ip}'`;
-        await client.executeCommand(command);
+        await client.executeCommand(`uci add_list network.${peerSection}.allowed_ips=${shellQuote(ip)}`);
       }
 
       // Optional parameters
       if (endpoint) {
-        await client.uciSet("network", peerSection, "endpoint_host", endpoint.split(":")[0]);
-        await client.uciSet("network", peerSection, "endpoint_port", endpoint.split(":")[1]);
+        const parts = endpoint.split(":");
+        const host = parts.slice(0, -1).join(":");
+        const port = parts[parts.length - 1];
+        await client.uciSet("network", peerSection, "endpoint_host", host);
+        await client.uciSet("network", peerSection, "endpoint_port", port);
       }
 
       if (persistent_keepalive) {
@@ -221,6 +218,10 @@ export const wireguardTools: Tool[] = [
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { interface: iface, peer_name } = args;
+
+      validateName(iface, "interface name");
+      validateName(peer_name, "peer name");
+
       const peerSection = `${iface}_${peer_name}`;
 
       // Delete peer section
@@ -246,7 +247,7 @@ export const wireguardTools: Tool[] = [
     handler: async (client: OpenWRTClient) => {
       const privateKey = (await client.executeCommand("wg genkey")).trim();
       const publicKey = (
-        await client.executeCommand(`echo "${privateKey}" | wg pubkey`)
+        await client.executeCommand(`echo ${shellQuote(privateKey)} | wg pubkey`)
       ).trim();
 
       return {
@@ -266,8 +267,10 @@ export const wireguardTools: Tool[] = [
     handler: async (client: OpenWRTClient) => {
       try {
         const config = await client.uciShow("network");
-        // Filter only WireGuard-related configuration
-        const lines = config.split("\n").filter((line) => line.includes("wireguard"));
+        // Filter WireGuard-related configuration (includes wg interface lines)
+        const lines = config.split("\n").filter(
+          (line) => line.includes("wireguard") || /^network\.wg\d+\./.test(line)
+        );
         return {
           success: true,
           configuration: lines.join("\n"),

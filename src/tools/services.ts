@@ -1,15 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
-
-export interface Tool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, any>;
-    required?: string[];
-  };
-  handler: (client: OpenWRTClient, args: Record<string, any>) => Promise<any>;
-}
+import { Tool } from "../types.js";
+import { shellQuote, validateName } from "../utils.js";
 
 export const serviceTools: Tool[] = [
   {
@@ -44,32 +35,26 @@ export const serviceTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, script_content, enable } = args;
 
-      try {
-        const servicePath = `/etc/init.d/${name}`;
+      validateName(name, "service name");
+      const servicePath = `/etc/init.d/${name}`;
 
-        // Write the service script
-        await client.writeFile(servicePath, script_content);
+      // Write the service script
+      await client.writeFile(servicePath, script_content);
 
-        // Make it executable
-        await client.executeCommand(`chmod +x ${servicePath}`);
+      // Make it executable
+      await client.executeCommand(`chmod +x ${shellQuote(servicePath)}`);
 
-        // Enable if requested
-        if (enable) {
-          await client.executeCommand(`${servicePath} enable`);
-        }
-
-        return {
-          success: true,
-          message: `Service ${name} created successfully`,
-          path: servicePath,
-          enabled: enable || false,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
+      // Enable if requested
+      if (enable) {
+        await client.executeCommand(`${shellQuote(servicePath)} enable`);
       }
+
+      return {
+        success: true,
+        message: `Service ${name} created successfully`,
+        path: servicePath,
+        enabled: enable || false,
+      };
     },
   },
   {
@@ -120,6 +105,8 @@ export const serviceTools: Tool[] = [
         enable,
       } = args;
 
+      validateName(name, "service name");
+
       const stopCmd = stop_command || `killall ${name}`;
       const desc = description || `${name} service`;
 
@@ -146,33 +133,26 @@ restart() {
 }
 `;
 
-      try {
-        const servicePath = `/etc/init.d/${name}`;
+      const servicePath = `/etc/init.d/${name}`;
 
-        // Write the service script
-        await client.writeFile(servicePath, scriptContent);
+      // Write the service script
+      await client.writeFile(servicePath, scriptContent);
 
-        // Make it executable
-        await client.executeCommand(`chmod +x ${servicePath}`);
+      // Make it executable
+      await client.executeCommand(`chmod +x ${shellQuote(servicePath)}`);
 
-        // Enable if requested
-        if (enable) {
-          await client.executeCommand(`${servicePath} enable`);
-        }
-
-        return {
-          success: true,
-          message: `Simple service ${name} created successfully`,
-          path: servicePath,
-          enabled: enable || false,
-          script: scriptContent,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
+      // Enable if requested
+      if (enable) {
+        await client.executeCommand(`${shellQuote(servicePath)} enable`);
       }
+
+      return {
+        success: true,
+        message: `Simple service ${name} created successfully`,
+        path: servicePath,
+        enabled: enable || false,
+        script: scriptContent,
+      };
     },
   },
   {
@@ -202,30 +182,24 @@ restart() {
         };
       }
 
+      validateName(name, "service name");
+      const servicePath = `/etc/init.d/${name}`;
+
+      // Disable and stop the service first (best-effort)
       try {
-        const servicePath = `/etc/init.d/${name}`;
-
-        // Disable and stop the service first
-        try {
-          await client.executeCommand(`${servicePath} stop`);
-          await client.executeCommand(`${servicePath} disable`);
-        } catch (error) {
-          // Ignore errors if service is not running or enabled
-        }
-
-        // Delete the service file
-        await client.executeCommand(`rm -f ${servicePath}`);
-
-        return {
-          success: true,
-          message: `Service ${name} deleted successfully`,
-        };
+        await client.executeCommand(`${shellQuote(servicePath)} stop`);
+        await client.executeCommand(`${shellQuote(servicePath)} disable`);
       } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
+        // Ignore errors if service is not running or enabled
       }
+
+      // Delete the service file
+      await client.executeCommand(`rm -f ${shellQuote(servicePath)}`);
+
+      return {
+        success: true,
+        message: `Service ${name} deleted successfully`,
+      };
     },
   },
   {
@@ -244,22 +218,16 @@ restart() {
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name } = args;
 
-      try {
-        const servicePath = `/etc/init.d/${name}`;
-        const content = await client.readFile(servicePath);
+      validateName(name, "service name");
+      const servicePath = `/etc/init.d/${name}`;
+      const content = await client.readFile(servicePath);
 
-        return {
-          success: true,
-          name,
-          path: servicePath,
-          content,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        name,
+        path: servicePath,
+        content,
+      };
     },
   },
   {
@@ -285,10 +253,7 @@ restart() {
             message: "No crontab entries found",
           };
         }
-        return {
-          success: false,
-          error: errorMsg,
-        };
+        throw error;
       }
     },
   },
@@ -316,37 +281,30 @@ restart() {
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { schedule, command, comment } = args;
 
+      // Get current crontab
+      let currentCron = "";
       try {
-        // Get current crontab
-        let currentCron = "";
-        try {
-          currentCron = await client.executeCommand("crontab -l");
-        } catch (error) {
-          // No crontab yet, that's fine
-        }
-
-        // Add new entry
-        const commentLine = comment ? `# ${comment}\n` : "";
-        const newEntry = `${commentLine}${schedule} ${command}`;
-        const newCron = currentCron ? `${currentCron}\n${newEntry}` : newEntry;
-
-        // Write new crontab
-        await client.executeCommand(`echo "${newCron}" | crontab -`);
-
-        // Restart cron service
-        await client.executeCommand("/etc/init.d/cron restart");
-
-        return {
-          success: true,
-          message: "Cron job added successfully",
-          entry: newEntry,
-        };
+        currentCron = await client.executeCommand("crontab -l");
       } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
+        // No crontab yet, that's fine
       }
+
+      // Add new entry
+      const commentLine = comment ? `# ${comment}\n` : "";
+      const newEntry = `${commentLine}${schedule} ${command}`;
+      const newCron = currentCron ? `${currentCron}\n${newEntry}` : newEntry;
+
+      // Write new crontab using heredoc to prevent shell expansion
+      await client.executeCommand(`cat << 'EOFCRON' | crontab -\n${newCron}\nEOFCRON`);
+
+      // Restart cron service
+      await client.executeCommand("/etc/init.d/cron restart");
+
+      return {
+        success: true,
+        message: "Cron job added successfully",
+        entry: newEntry,
+      };
     },
   },
   {
@@ -376,33 +334,26 @@ restart() {
         };
       }
 
-      try {
-        // Get current crontab
-        const currentCron = await client.executeCommand("crontab -l");
+      // Get current crontab
+      const currentCron = await client.executeCommand("crontab -l");
 
-        // Filter out matching lines
-        const lines = currentCron.split("\n");
-        const filteredLines = lines.filter((line) => !line.includes(pattern));
-        const newCron = filteredLines.join("\n");
+      // Filter out matching lines
+      const lines = currentCron.split("\n");
+      const filteredLines = lines.filter((line) => !line.includes(pattern));
+      const newCron = filteredLines.join("\n");
 
-        // Write new crontab
-        await client.executeCommand(`echo "${newCron}" | crontab -`);
+      // Write new crontab using heredoc to prevent shell expansion
+      await client.executeCommand(`cat << 'EOFCRON' | crontab -\n${newCron}\nEOFCRON`);
 
-        // Restart cron service
-        await client.executeCommand("/etc/init.d/cron restart");
+      // Restart cron service
+      await client.executeCommand("/etc/init.d/cron restart");
 
-        const removedCount = lines.length - filteredLines.length;
+      const removedCount = lines.length - filteredLines.length;
 
-        return {
-          success: true,
-          message: `${removedCount} cron job(s) removed`,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `${removedCount} cron job(s) removed`,
+      };
     },
   },
 ];

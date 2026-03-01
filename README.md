@@ -102,8 +102,9 @@ The server is configured via environment variables:
 - `OPENWRT_HOST` - Router IP address (default: 192.168.1.1)
 - `OPENWRT_PORT` - SSH port (default: 22)
 - `OPENWRT_USERNAME` - SSH username (default: root)
-- `OPENWRT_PASSWORD` - SSH password (required if no private key)
-- `OPENWRT_PRIVATE_KEY` - SSH private key path (required if no password)
+- `OPENWRT_PASSWORD` - SSH password (required if no key)
+- `OPENWRT_PRIVATE_KEY_FILE` - Path to SSH private key file (required if no password)
+- `OPENWRT_PRIVATE_KEY` - SSH private key content directly (alternative to file path)
 
 ### Example: Using Password Authentication
 
@@ -115,7 +116,15 @@ export OPENWRT_USERNAME=root
 export OPENWRT_PASSWORD=your_password
 ```
 
-### Example: Using SSH Key Authentication
+### Example: Using SSH Key Authentication (path to file)
+
+```bash
+export OPENWRT_HOST=192.168.1.1
+export OPENWRT_USERNAME=root
+export OPENWRT_PRIVATE_KEY_FILE=~/.ssh/id_rsa
+```
+
+### Example: Using SSH Key Authentication (key content)
 
 ```bash
 export OPENWRT_HOST=192.168.1.1
@@ -150,6 +159,24 @@ On Windows, edit `%APPDATA%\Claude\claude_desktop_config.json`:
 }
 ```
 
+With SSH key file:
+
+```json
+{
+  "mcpServers": {
+    "openwrt": {
+      "command": "node",
+      "args": ["E:\\OpenWRT\\mcp\\build\\index.js"],
+      "env": {
+        "OPENWRT_HOST": "192.168.1.1",
+        "OPENWRT_USERNAME": "root",
+        "OPENWRT_PRIVATE_KEY_FILE": "C:\\Users\\YourUser\\.ssh\\id_rsa"
+      }
+    }
+  }
+}
+```
+
 On macOS/Linux, edit `~/.config/claude/claude_desktop_config.json`:
 
 ```json
@@ -162,6 +189,24 @@ On macOS/Linux, edit `~/.config/claude/claude_desktop_config.json`:
         "OPENWRT_HOST": "192.168.1.1",
         "OPENWRT_USERNAME": "root",
         "OPENWRT_PASSWORD": "your_password"
+      }
+    }
+  }
+}
+```
+
+With SSH key file:
+
+```json
+{
+  "mcpServers": {
+    "openwrt": {
+      "command": "node",
+      "args": ["/path/to/mcp/build/index.js"],
+      "env": {
+        "OPENWRT_HOST": "192.168.1.1",
+        "OPENWRT_USERNAME": "root",
+        "OPENWRT_PRIVATE_KEY_FILE": "/home/youruser/.ssh/id_rsa"
       }
     }
   }

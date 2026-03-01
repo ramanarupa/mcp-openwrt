@@ -1,15 +1,8 @@
 import { OpenWRTClient } from "../openwrt-client.js";
+import { Tool } from "../types.js";
+import { shellQuote, validateName } from "../utils.js";
 
-export interface Tool {
-  name: string;
-  description: string;
-  inputSchema: {
-    type: string;
-    properties: Record<string, any>;
-    required?: string[];
-  };
-  handler: (client: OpenWRTClient, args: Record<string, any>) => Promise<any>;
-}
+const VALID_SERVICE_ACTIONS = ["start", "stop", "restart", "reload", "enable", "disable", "status"] as const;
 
 export const systemTools: Tool[] = [
   {
@@ -57,19 +50,11 @@ export const systemTools: Tool[] = [
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { command } = args;
-
-      try {
-        const output = await client.executeCommand(command);
-        return {
-          success: true,
-          output,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      const output = await client.executeCommand(command);
+      return {
+        success: true,
+        output,
+      };
     },
   },
   {
@@ -117,7 +102,7 @@ export const systemTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { filter } = args;
       const command = filter
-        ? `opkg list-installed | grep ${filter}`
+        ? `opkg list-installed | grep -F -- ${shellQuote(filter)}`
         : "opkg list-installed";
 
       const output = await client.executeCommand(command);
@@ -143,25 +128,17 @@ export const systemTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { package: pkg } = args;
 
-      try {
-        // Update package list first
-        await client.executeCommand("opkg update");
+      // Update package list first
+      await client.executeCommand("opkg update");
 
-        // Install package
-        const output = await client.executeCommand(`opkg install ${pkg}`);
+      // Install package
+      const output = await client.executeCommand(`opkg install ${shellQuote(pkg)}`);
 
-        return {
-          success: true,
-          message: `Package ${pkg} installed successfully`,
-          output,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          message: `Failed to install package ${pkg}`,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `Package ${pkg} installed successfully`,
+        output,
+      };
     },
   },
   {
@@ -179,22 +156,13 @@ export const systemTools: Tool[] = [
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { package: pkg } = args;
+      const output = await client.executeCommand(`opkg remove ${shellQuote(pkg)}`);
 
-      try {
-        const output = await client.executeCommand(`opkg remove ${pkg}`);
-
-        return {
-          success: true,
-          message: `Package ${pkg} removed successfully`,
-          output,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          message: `Failed to remove package ${pkg}`,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: `Package ${pkg} removed successfully`,
+        output,
+      };
     },
   },
   {
@@ -233,20 +201,17 @@ export const systemTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { service, action } = args;
 
-      try {
-        const output = await client.executeCommand(`/etc/init.d/${service} ${action}`);
-        return {
-          success: true,
-          message: `Service ${service} ${action} executed`,
-          output,
-        };
-      } catch (error) {
-        return {
-          success: false,
-          message: `Failed to ${action} service ${service}`,
-          error: error instanceof Error ? error.message : String(error),
-        };
+      validateName(service, "service name");
+      if (!VALID_SERVICE_ACTIONS.includes(action)) {
+        throw new Error(`Invalid action: ${JSON.stringify(action)}. Must be one of: ${VALID_SERVICE_ACTIONS.join(", ")}`);
       }
+
+      const output = await client.executeCommand(`/etc/init.d/${service} ${action}`);
+      return {
+        success: true,
+        message: `Service ${service} ${action} executed`,
+        output,
+      };
     },
   },
   {
@@ -272,18 +237,11 @@ export const systemTools: Tool[] = [
         };
       }
 
-      try {
-        await client.executeCommand("reboot");
-        return {
-          success: true,
-          message: "Reboot command sent. Device will restart shortly.",
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      await client.executeCommand("reboot");
+      return {
+        success: true,
+        message: "Reboot command sent. Device will restart shortly.",
+      };
     },
   },
   {
@@ -294,22 +252,16 @@ export const systemTools: Tool[] = [
       properties: {},
     },
     handler: async (client: OpenWRTClient) => {
-      try {
-        // Generate backup archive
-        const output = await client.executeCommand("sysupgrade -b /tmp/backup.tar.gz && cat /tmp/backup.tar.gz | base64");
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const backupPath = `/tmp/backup-${timestamp}.tar.gz`;
+      await client.executeCommand(`sysupgrade -b ${shellQuote(backupPath)}`);
 
-        return {
-          success: true,
-          message: "Configuration backup created",
-          backup_data: output,
-          note: "Backup is base64 encoded. Decode and save as .tar.gz file",
-        };
-      } catch (error) {
-        return {
-          success: false,
-          error: error instanceof Error ? error.message : String(error),
-        };
-      }
+      return {
+        success: true,
+        message: "Configuration backup created",
+        backup_path: backupPath,
+        note: "Backup saved on router. Use file_read or scp to retrieve it.",
+      };
     },
   },
 ];

@@ -1,4 +1,7 @@
-import { Client } from "ssh2";
+import { Client, ClientChannel } from "ssh2";
+import { shellQuote, uniqueHeredocDelimiter } from "./utils.js";
+
+const DEFAULT_COMMAND_TIMEOUT = 30_000; // 30 seconds
 
 export interface OpenWRTConfig {
   host: string;
@@ -12,6 +15,7 @@ export class OpenWRTClient {
   private client: Client;
   private config: OpenWRTConfig;
   private connected: boolean = false;
+  private connectPromise: Promise<void> | null = null;
 
   constructor(config: OpenWRTConfig) {
     this.config = config;
@@ -22,15 +26,37 @@ export class OpenWRTClient {
     if (this.connected) {
       return;
     }
+    if (this.connectPromise) {
+      return this.connectPromise;
+    }
 
-    return new Promise((resolve, reject) => {
+    this.connectPromise = this._doConnect();
+    try {
+      await this.connectPromise;
+    } finally {
+      this.connectPromise = null;
+    }
+  }
+
+  private async _doConnect(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      // Create a fresh client for each connection attempt
+      this.client = new Client();
+
       this.client
         .on("ready", () => {
           this.connected = true;
           resolve();
         })
         .on("error", (err) => {
+          this.connected = false;
           reject(err);
+        })
+        .on("close", () => {
+          this.connected = false;
+        })
+        .on("end", () => {
+          this.connected = false;
         })
         .connect({
           host: this.config.host,
@@ -38,8 +64,18 @@ export class OpenWRTClient {
           username: this.config.username,
           password: this.config.password,
           privateKey: this.config.privateKey,
+          keepaliveInterval: 15_000,
+          keepaliveCountMax: 3,
+          readyTimeout: 10_000,
         });
     });
+  }
+
+  private async ensureConnected(): Promise<void> {
+    if (!this.connected) {
+      console.error("SSH connection lost, reconnecting...");
+      await this.connect();
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -49,27 +85,51 @@ export class OpenWRTClient {
     }
   }
 
-  async executeCommand(command: string): Promise<string> {
-    if (!this.connected) {
-      throw new Error("Not connected to OpenWRT device");
-    }
+  async executeCommand(command: string, timeout: number = DEFAULT_COMMAND_TIMEOUT): Promise<string> {
+    await this.ensureConnected();
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let activeStream: ClientChannel | null = null;
+
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          if (activeStream) {
+            activeStream.close();
+          }
+          reject(new Error(`Command timed out after ${timeout}ms: ${command.slice(0, 100)}`));
+        }
+      }, timeout);
+
       this.client.exec(command, (err, stream) => {
         if (err) {
-          reject(err);
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            // Connection may have dropped — mark as disconnected
+            if (err.message?.includes("Not connected") || err.message?.includes("Channel open")) {
+              this.connected = false;
+            }
+            reject(err);
+          }
           return;
         }
 
+        activeStream = stream;
         let stdout = "";
         let stderr = "";
 
         stream
           .on("close", (code: number) => {
-            if (code !== 0) {
-              reject(new Error(`Command failed with code ${code}: ${stderr}`));
-            } else {
-              resolve(stdout);
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              if (code !== 0) {
+                reject(new Error(`Command failed with code ${code}: ${stderr}`));
+              } else {
+                resolve(stdout);
+              }
             }
           })
           .on("data", (data: Buffer) => {
@@ -90,7 +150,7 @@ export class OpenWRTClient {
    */
   async ubusCall(path: string, method: string, params?: Record<string, any>): Promise<any> {
     const paramsJson = params ? JSON.stringify(params) : "{}";
-    const command = `ubus call ${path} ${method} '${paramsJson}'`;
+    const command = `ubus call ${path} ${method} ${shellQuote(paramsJson)}`;
 
     const output = await this.executeCommand(command);
 
@@ -125,7 +185,8 @@ export class OpenWRTClient {
    */
   async uciSet(config: string, section: string, option: string, value: string): Promise<void> {
     const path = `${config}.${section}.${option}`;
-    const command = `uci set ${path}='${value}'`;
+    const escapedValue = value.replace(/'/g, "'\\''");
+    const command = `uci set ${path}='${escapedValue}'`;
     await this.executeCommand(command);
   }
 
@@ -176,7 +237,7 @@ export class OpenWRTClient {
    * @param path - file path (e.g., "/etc/config/network")
    */
   async readFile(path: string): Promise<string> {
-    const command = `cat ${path}`;
+    const command = `cat ${shellQuote(path)}`;
     return await this.executeCommand(command);
   }
 
@@ -186,10 +247,8 @@ export class OpenWRTClient {
    * @param content - content to write
    */
   async writeFile(path: string, content: string): Promise<void> {
-    // Escape single quotes in content
-    content.replace(/'/g, "'\\''");
-    // Use cat with heredoc for reliable multi-line content
-    const command = `cat > ${path} << 'EOFMCP'\n${content}\nEOFMCP`;
+    const delimiter = uniqueHeredocDelimiter(content);
+    const command = `cat > ${shellQuote(path)} << '${delimiter}'\n${content}\n${delimiter}`;
     await this.executeCommand(command);
   }
 }
