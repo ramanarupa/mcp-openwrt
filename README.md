@@ -79,7 +79,7 @@ MCP (Model Context Protocol) server for configuring and managing OpenWRT routers
 ## Prerequisites
 
 - Node.js 18+ and npm
-- OpenWRT router with SSH access
+- OpenWRT router with SSH access (tested on OpenWRT 24)
 - SSH credentials (password or private key)
 
 ## Installation
