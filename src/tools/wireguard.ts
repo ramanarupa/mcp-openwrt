@@ -66,19 +66,25 @@ export const wireguardTools: Tool[] = [
         privateKey = (await client.executeCommand("wg genkey")).trim();
       }
 
-      // Create interface section
-      await client.uciAddSection("network", name, "interface");
-      await client.uciSet("network", name, "proto", "wireguard");
-      await client.uciSet("network", name, "private_key", privateKey);
-      await client.uciSet("network", name, "listen_port", listen_port.toString());
+      try {
+        // Create interface section
+        await client.uciAddSection("network", name, "interface");
+        await client.uciSet("network", name, "proto", "wireguard");
+        await client.uciSet("network", name, "private_key", privateKey);
+        await client.uciSet("network", name, "listen_port", listen_port.toString());
 
-      // Add IP addresses
-      for (const addr of addresses) {
-        await client.executeCommand(`uci add_list network.${name}.addresses=${shellQuote(addr)}`);
+        // Add IP addresses
+        for (const addr of addresses) {
+          await client.executeCommand(`uci add_list network.${name}.addresses=${shellQuote(addr)}`);
+        }
+
+        // Commit and reload
+        await client.uciCommit("network");
+      } catch (error) {
+        await client.uciRevert("network");
+        throw error;
       }
 
-      // Commit and reload
-      await client.uciCommit("network");
       await client.reloadNetwork();
 
       // Get public key
@@ -152,38 +158,44 @@ export const wireguardTools: Tool[] = [
 
       // Create peer section
       const peerSection = `${iface}_${peer_name}`;
-      await client.uciAddSection("network", peerSection, "wireguard_" + iface);
-      await client.uciSet("network", peerSection, "public_key", public_key);
+      try {
+        await client.uciAddSection("network", peerSection, "wireguard_" + iface);
+        await client.uciSet("network", peerSection, "public_key", public_key);
 
-      // Add allowed IPs
-      for (const ip of allowed_ips) {
-        await client.executeCommand(`uci add_list network.${peerSection}.allowed_ips=${shellQuote(ip)}`);
+        // Add allowed IPs
+        for (const ip of allowed_ips) {
+          await client.executeCommand(`uci add_list network.${peerSection}.allowed_ips=${shellQuote(ip)}`);
+        }
+
+        // Optional parameters
+        if (endpoint) {
+          const parts = endpoint.split(":");
+          const host = parts.slice(0, -1).join(":");
+          const port = parts[parts.length - 1];
+          await client.uciSet("network", peerSection, "endpoint_host", host);
+          await client.uciSet("network", peerSection, "endpoint_port", port);
+        }
+
+        if (persistent_keepalive) {
+          await client.uciSet(
+            "network",
+            peerSection,
+            "persistent_keepalive",
+            persistent_keepalive.toString()
+          );
+        }
+
+        if (preshared_key) {
+          await client.uciSet("network", peerSection, "preshared_key", preshared_key);
+        }
+
+        // Commit and reload
+        await client.uciCommit("network");
+      } catch (error) {
+        await client.uciRevert("network");
+        throw error;
       }
 
-      // Optional parameters
-      if (endpoint) {
-        const parts = endpoint.split(":");
-        const host = parts.slice(0, -1).join(":");
-        const port = parts[parts.length - 1];
-        await client.uciSet("network", peerSection, "endpoint_host", host);
-        await client.uciSet("network", peerSection, "endpoint_port", port);
-      }
-
-      if (persistent_keepalive) {
-        await client.uciSet(
-          "network",
-          peerSection,
-          "persistent_keepalive",
-          persistent_keepalive.toString()
-        );
-      }
-
-      if (preshared_key) {
-        await client.uciSet("network", peerSection, "preshared_key", preshared_key);
-      }
-
-      // Commit and reload
-      await client.uciCommit("network");
       await client.reloadNetwork();
 
       return {
@@ -224,8 +236,8 @@ export const wireguardTools: Tool[] = [
 
       const peerSection = `${iface}_${peer_name}`;
 
-      // Delete peer section
-      await client.executeCommand(`uci delete network.${peerSection}`);
+      // Delete peer section (peerSection is built from validateName-checked parts)
+      await client.executeCommand(`uci delete ${shellQuote(`network.${peerSection}`)}`);
 
       // Commit and reload
       await client.uciCommit("network");

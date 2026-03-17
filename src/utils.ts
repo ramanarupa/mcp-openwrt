@@ -31,6 +31,40 @@ export function validateMode(mode: string): void {
 }
 
 /**
+ * Validate that a path is absolute and does not contain traversal sequences.
+ * Throws on relative paths, ".." components, or empty strings.
+ */
+export function validateAbsolutePath(value: string, label: string): void {
+  if (!value || !value.startsWith("/") || /(?:^|\/)\.\.(\/|$)/.test(value)) {
+    throw new Error(
+      `Invalid ${label}: ${JSON.stringify(value)}. Must be an absolute path without ".." components.`
+    );
+  }
+}
+
+/**
+ * Validate that a value is a safe integer within the given range.
+ */
+export function validateInt(value: unknown, label: string, min: number, max: number): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < min || n > max) {
+    throw new Error(
+      `Invalid ${label}: ${JSON.stringify(value)}. Must be an integer between ${min} and ${max}.`
+    );
+  }
+  return n;
+}
+
+/**
+ * Escape a value for safe embedding inside single-quoted shell strings.
+ * Unlike shellQuote, this returns just the escaped content without surrounding quotes —
+ * useful when interpolating into a shell variable assignment like: VAR='<escaped>'
+ */
+export function shellEscape(arg: string): string {
+  return arg.replace(/'/g, "'\\''");
+}
+
+/**
  * Return a heredoc delimiter that does not collide with the content.
  * Starts with "EOFMCP" and appends an incrementing suffix if needed.
  */

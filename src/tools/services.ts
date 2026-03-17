@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateName } from "../utils.js";
+import { shellQuote, validateName, validateInt, uniqueHeredocDelimiter } from "../utils.js";
 
 export const serviceTools: Tool[] = [
   {
@@ -106,6 +106,8 @@ export const serviceTools: Tool[] = [
       } = args;
 
       validateName(name, "service name");
+      const safeStartPriority = validateInt(start_priority, "start_priority", 0, 99);
+      const safeStopPriority = validateInt(stop_priority, "stop_priority", 0, 99);
 
       const stopCmd = stop_command || `killall ${name}`;
       const desc = description || `${name} service`;
@@ -113,8 +115,8 @@ export const serviceTools: Tool[] = [
       const scriptContent = `#!/bin/sh /etc/rc.common
 # ${desc}
 
-START=${start_priority}
-STOP=${stop_priority}
+START=${safeStartPriority}
+STOP=${safeStopPriority}
 
 start() {
     echo "Starting ${name}"
@@ -295,7 +297,8 @@ restart() {
       const newCron = currentCron ? `${currentCron}\n${newEntry}` : newEntry;
 
       // Write new crontab using heredoc to prevent shell expansion
-      await client.executeCommand(`cat << 'EOFCRON' | crontab -\n${newCron}\nEOFCRON`);
+      const delimiter = uniqueHeredocDelimiter(newCron);
+      await client.executeCommand(`cat << '${delimiter}' | crontab -\n${newCron}\n${delimiter}`);
 
       // Restart cron service
       await client.executeCommand("/etc/init.d/cron restart");
@@ -343,7 +346,8 @@ restart() {
       const newCron = filteredLines.join("\n");
 
       // Write new crontab using heredoc to prevent shell expansion
-      await client.executeCommand(`cat << 'EOFCRON' | crontab -\n${newCron}\nEOFCRON`);
+      const delimiter = uniqueHeredocDelimiter(newCron);
+      await client.executeCommand(`cat << '${delimiter}' | crontab -\n${newCron}\n${delimiter}`);
 
       // Restart cron service
       await client.executeCommand("/etc/init.d/cron restart");

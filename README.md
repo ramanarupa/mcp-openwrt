@@ -79,7 +79,7 @@ MCP (Model Context Protocol) server for configuring and managing OpenWRT routers
 ## Prerequisites
 
 - Node.js 18+ and npm
-- OpenWRT router with SSH access (tested on OpenWRT 24)
+- OpenWRT 25.x or later (uses `apk` package manager; older versions with `opkg` are **not** supported)
 - SSH credentials (password or private key)
 
 ## Installation
@@ -338,11 +338,11 @@ List installed packages.
 - `filter` (optional): Filter packages by name
 
 #### `openwrt_package_install`
-Install a package using opkg.
+Install a package using apk.
 - `package` (required): Package name to install
 
 #### `openwrt_package_remove`
-Remove a package using opkg.
+Remove a package using apk.
 - `package` (required): Package name to remove
 
 #### `openwrt_service_list`

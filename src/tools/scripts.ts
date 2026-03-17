@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote } from "../utils.js";
+import { shellQuote, validateName, validateAbsolutePath, shellEscape } from "../utils.js";
 
 export const scriptTools: Tool[] = [
   {
@@ -41,6 +41,8 @@ export const scriptTools: Tool[] = [
         shebang = "#!/bin/sh",
       } = args;
 
+      validateName(name, "script name");
+      validateAbsolutePath(directory, "directory");
       const scriptPath = `${directory}/${name}`;
 
       // Add shebang if not present
@@ -131,13 +133,16 @@ export const scriptTools: Tool[] = [
         destination = "/tmp/backups",
       } = args;
 
-      const dirsString = backup_dirs.join(" ");
+      validateName(name, "script name");
+
+      const escapedDirs = backup_dirs.map((d: string) => shellEscape(d)).join(" ");
+      const escapedDest = shellEscape(destination);
       const scriptContent = `#!/bin/sh
 # Automatic backup script
 # Created by OpenWRT MCP Server
 
-BACKUP_DIRS="${dirsString}"
-DEST_DIR="${destination}"
+BACKUP_DIRS='${escapedDirs}'
+DEST_DIR='${escapedDest}'
 DATE=$(date +%Y%m%d_%H%M%S)
 BACKUP_FILE="$DEST_DIR/backup_$DATE.tar.gz"
 
@@ -203,15 +208,18 @@ fi
         log_file = "/var/log/monitor.log",
       } = args;
 
+      validateName(name, "script name");
+
+      const escapedLogFile = shellEscape(log_file);
       const emailAlert = email
-        ? `echo "$MESSAGE" | sendmail ${email}`
-        : `echo "$MESSAGE" >> ${log_file}`;
+        ? `echo "$MESSAGE" | sendmail ${shellEscape(email)}`
+        : `echo "$MESSAGE" >> "$LOG_FILE"`;
 
       const scriptContent = `#!/bin/sh
 # System monitoring script
 # Created by OpenWRT MCP Server
 
-LOG_FILE="${log_file}"
+LOG_FILE='${escapedLogFile}'
 ALERT_THRESHOLD_CPU=80
 ALERT_THRESHOLD_MEM=90
 

@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote } from "../utils.js";
+import { shellQuote, validateName } from "../utils.js";
 
 export const dnsTools: Tool[] = [
   {
@@ -84,13 +84,21 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, hostname, ip } = args;
 
-      // Create new domain section
-      await client.uciAddSection("dhcp", name, "domain");
-      await client.uciSet("dhcp", name, "name", hostname);
-      await client.uciSet("dhcp", name, "ip", ip);
+      validateName(name, "entry name");
 
-      // Commit and reload
-      await client.uciCommit("dhcp");
+      try {
+        // Create new domain section
+        await client.uciAddSection("dhcp", name, "domain");
+        await client.uciSet("dhcp", name, "name", hostname);
+        await client.uciSet("dhcp", name, "ip", ip);
+
+        // Commit and reload
+        await client.uciCommit("dhcp");
+      } catch (error) {
+        await client.uciRevert("dhcp");
+        throw error;
+      }
+
       await client.reloadDnsmasq();
 
       return {
@@ -124,13 +132,21 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, cname, target } = args;
 
-      // Create new cname section
-      await client.uciAddSection("dhcp", name, "cname");
-      await client.uciSet("dhcp", name, "cname", cname);
-      await client.uciSet("dhcp", name, "target", target);
+      validateName(name, "entry name");
 
-      // Commit and reload
-      await client.uciCommit("dhcp");
+      try {
+        // Create new cname section
+        await client.uciAddSection("dhcp", name, "cname");
+        await client.uciSet("dhcp", name, "cname", cname);
+        await client.uciSet("dhcp", name, "target", target);
+
+        // Commit and reload
+        await client.uciCommit("dhcp");
+      } catch (error) {
+        await client.uciRevert("dhcp");
+        throw error;
+      }
+
       await client.reloadDnsmasq();
 
       return {
@@ -168,14 +184,22 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { interface: iface, start, limit, leasetime } = args;
 
-      // Configure DHCP pool
-      await client.uciSet("dhcp", iface, "interface", iface);
-      await client.uciSet("dhcp", iface, "start", start.toString());
-      await client.uciSet("dhcp", iface, "limit", limit.toString());
-      await client.uciSet("dhcp", iface, "leasetime", leasetime);
+      validateName(iface, "interface name");
 
-      // Commit and reload
-      await client.uciCommit("dhcp");
+      try {
+        // Configure DHCP pool
+        await client.uciSet("dhcp", iface, "interface", iface);
+        await client.uciSet("dhcp", iface, "start", start.toString());
+        await client.uciSet("dhcp", iface, "limit", limit.toString());
+        await client.uciSet("dhcp", iface, "leasetime", leasetime);
+
+        // Commit and reload
+        await client.uciCommit("dhcp");
+      } catch (error) {
+        await client.uciRevert("dhcp");
+        throw error;
+      }
+
       await client.reloadDnsmasq();
 
       return {
@@ -213,17 +237,25 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, mac, ip, hostname } = args;
 
-      // Create new host section
-      await client.uciAddSection("dhcp", name, "host");
-      await client.uciSet("dhcp", name, "mac", mac);
-      await client.uciSet("dhcp", name, "ip", ip);
+      validateName(name, "entry name");
 
-      if (hostname) {
-        await client.uciSet("dhcp", name, "name", hostname);
+      try {
+        // Create new host section
+        await client.uciAddSection("dhcp", name, "host");
+        await client.uciSet("dhcp", name, "mac", mac);
+        await client.uciSet("dhcp", name, "ip", ip);
+
+        if (hostname) {
+          await client.uciSet("dhcp", name, "name", hostname);
+        }
+
+        // Commit and reload
+        await client.uciCommit("dhcp");
+      } catch (error) {
+        await client.uciRevert("dhcp");
+        throw error;
       }
 
-      // Commit and reload
-      await client.uciCommit("dhcp");
       await client.reloadDnsmasq();
 
       return {

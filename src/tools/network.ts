@@ -71,22 +71,27 @@ export const networkTools: Tool[] = [
 
       validateName(iface, "interface name");
 
-      // Set protocol to static
-      await client.uciSet("network", iface, "proto", "static");
+      try {
+        // Set protocol to static
+        await client.uciSet("network", iface, "proto", "static");
 
-      // Set IP address
-      await client.uciSet("network", iface, "ipaddr", ipaddr);
+        // Set IP address
+        await client.uciSet("network", iface, "ipaddr", ipaddr);
 
-      // Set netmask
-      await client.uciSet("network", iface, "netmask", netmask);
+        // Set netmask
+        await client.uciSet("network", iface, "netmask", netmask);
 
-      // Set gateway if provided
-      if (gateway) {
-        await client.uciSet("network", iface, "gateway", gateway);
+        // Set gateway if provided
+        if (gateway) {
+          await client.uciSet("network", iface, "gateway", gateway);
+        }
+
+        // Commit changes
+        await client.uciCommit("network");
+      } catch (error) {
+        await client.uciRevert("network");
+        throw error;
       }
-
-      // Commit changes
-      await client.uciCommit("network");
 
       // Reload network
       await client.reloadNetwork();
@@ -176,17 +181,23 @@ export const networkTools: Tool[] = [
 
       validateName(name, "route name");
 
-      // Create new route section
-      await client.uciAddSection("network", name, "route");
-      await client.uciSet("network", name, "target", target);
-      await client.uciSet("network", name, "gateway", gateway);
+      try {
+        // Create new route section
+        await client.uciAddSection("network", name, "route");
+        await client.uciSet("network", name, "target", target);
+        await client.uciSet("network", name, "gateway", gateway);
 
-      if (iface) {
-        await client.uciSet("network", name, "interface", iface);
+        if (iface) {
+          await client.uciSet("network", name, "interface", iface);
+        }
+
+        // Commit and reload
+        await client.uciCommit("network");
+      } catch (error) {
+        await client.uciRevert("network");
+        throw error;
       }
 
-      // Commit and reload
-      await client.uciCommit("network");
       await client.reloadNetwork();
 
       return {

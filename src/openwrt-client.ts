@@ -1,5 +1,5 @@
 import { Client, ClientChannel } from "ssh2";
-import { shellQuote, uniqueHeredocDelimiter } from "./utils.js";
+import { shellQuote, validateName, uniqueHeredocDelimiter } from "./utils.js";
 
 const DEFAULT_COMMAND_TIMEOUT = 30_000; // 30 seconds
 
@@ -149,6 +149,12 @@ export class OpenWRTClient {
    * @param params - parameters as object
    */
   async ubusCall(path: string, method: string, params?: Record<string, any>): Promise<any> {
+    // Validate path and method to prevent shell injection (e.g. "network.interface" / "dump")
+    for (const part of path.split(".")) {
+      validateName(part, "ubus path component");
+    }
+    validateName(method, "ubus method");
+
     const paramsJson = params ? JSON.stringify(params) : "{}";
     const command = `ubus call ${path} ${method} ${shellQuote(paramsJson)}`;
 
@@ -185,8 +191,7 @@ export class OpenWRTClient {
    */
   async uciSet(config: string, section: string, option: string, value: string): Promise<void> {
     const path = `${config}.${section}.${option}`;
-    const escapedValue = value.replace(/'/g, "'\\''");
-    const command = `uci set ${path}='${escapedValue}'`;
+    const command = `uci set ${path}=${shellQuote(value)}`;
     await this.executeCommand(command);
   }
 
@@ -196,6 +201,15 @@ export class OpenWRTClient {
    */
   async uciCommit(config?: string): Promise<void> {
     const command = config ? `uci commit ${config}` : "uci commit";
+    await this.executeCommand(command);
+  }
+
+  /**
+   * Revert uncommitted UCI changes
+   * @param config - config name (optional, reverts all if not specified)
+   */
+  async uciRevert(config?: string): Promise<void> {
+    const command = config ? `uci revert ${config}` : "uci revert";
     await this.executeCommand(command);
   }
 

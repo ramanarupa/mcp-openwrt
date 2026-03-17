@@ -37,7 +37,7 @@ export const systemTools: Tool[] = [
   },
   {
     name: "openwrt_system_execute_command",
-    description: "Execute a shell command on the OpenWRT device (use with caution)",
+    description: "Execute a shell command on the OpenWRT device. WARNING: This runs arbitrary commands — use with caution. Set confirm to true to proceed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -45,11 +45,23 @@ export const systemTools: Tool[] = [
           type: "string",
           description: "Shell command to execute",
         },
+        confirm: {
+          type: "boolean",
+          description: "Must be set to true to confirm execution",
+        },
       },
-      required: ["command"],
+      required: ["command", "confirm"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
-      const { command } = args;
+      const { command, confirm } = args;
+
+      if (!confirm) {
+        return {
+          success: false,
+          message: "Execution not confirmed. Set confirm to true to proceed.",
+        };
+      }
+
       const output = await client.executeCommand(command);
       return {
         success: true,
@@ -102,8 +114,8 @@ export const systemTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { filter } = args;
       const command = filter
-        ? `opkg list-installed | grep -F -- ${shellQuote(filter)}`
-        : "opkg list-installed";
+        ? `apk list --installed | grep -F -- ${shellQuote(filter)}`
+        : "apk list --installed";
 
       const output = await client.executeCommand(command);
       return {
@@ -114,7 +126,7 @@ export const systemTools: Tool[] = [
   },
   {
     name: "openwrt_package_install",
-    description: "Install a package using opkg",
+    description: "Install a package using apk",
     inputSchema: {
       type: "object",
       properties: {
@@ -129,10 +141,10 @@ export const systemTools: Tool[] = [
       const { package: pkg } = args;
 
       // Update package list first
-      await client.executeCommand("opkg update");
+      await client.executeCommand("apk update");
 
       // Install package
-      const output = await client.executeCommand(`opkg install ${shellQuote(pkg)}`);
+      const output = await client.executeCommand(`apk add ${shellQuote(pkg)}`);
 
       return {
         success: true,
@@ -143,7 +155,7 @@ export const systemTools: Tool[] = [
   },
   {
     name: "openwrt_package_remove",
-    description: "Remove a package using opkg",
+    description: "Remove a package using apk",
     inputSchema: {
       type: "object",
       properties: {
@@ -156,7 +168,7 @@ export const systemTools: Tool[] = [
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { package: pkg } = args;
-      const output = await client.executeCommand(`opkg remove ${shellQuote(pkg)}`);
+      const output = await client.executeCommand(`apk del ${shellQuote(pkg)}`);
 
       return {
         success: true,

@@ -148,10 +148,10 @@ describe("System tools", () => {
     await tool.handler(client, { package: "luci-app-test" });
 
     const installCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0].includes("opkg install")
+      (c) => c.method === "executeCommand" && c.args[0].includes("apk add")
     );
     expect(installCall).toBeDefined();
-    expect(installCall!.args[0]).toBe("opkg install 'luci-app-test'");
+    expect(installCall!.args[0]).toBe("apk add 'luci-app-test'");
   });
 
   it("package_remove uses shellQuote", async () => {
@@ -159,10 +159,10 @@ describe("System tools", () => {
     await tool.handler(client, { package: "test-pkg" });
 
     const removeCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0].includes("opkg remove")
+      (c) => c.method === "executeCommand" && c.args[0].includes("apk del")
     );
     expect(removeCall).toBeDefined();
-    expect(removeCall!.args[0]).toBe("opkg remove 'test-pkg'");
+    expect(removeCall!.args[0]).toBe("apk del 'test-pkg'");
   });
 
   it("service_control with invalid service name throws", async () => {
@@ -190,6 +190,24 @@ describe("System tools", () => {
     const result = await tool.handler(client, { confirm: false });
     expect(result.success).toBe(false);
     expect(result.message).toContain("not confirmed");
+  });
+
+  it("execute_command without confirm returns not-confirmed", async () => {
+    const tool = findTool(systemTools, "openwrt_system_execute_command");
+    const result = await tool.handler(client, { command: "ls", confirm: false });
+    expect(result.success).toBe(false);
+    expect(result.message).toContain("not confirmed");
+    expect(client.calls.filter((c) => c.method === "executeCommand")).toHaveLength(0);
+  });
+
+  it("execute_command with confirm executes the command", async () => {
+    const tool = findTool(systemTools, "openwrt_system_execute_command");
+    const result = await tool.handler(client, { command: "uptime", confirm: true });
+    expect(result.success).toBe(true);
+    const execCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0] === "uptime"
+    );
+    expect(execCall).toBeDefined();
   });
 
   it("package_list_installed filter uses -F and shellQuote", async () => {
@@ -248,6 +266,56 @@ describe("Service tools", () => {
     await expect(
       tool.handler(client, { name: "$(cmd)" })
     ).rejects.toThrow("Invalid service name");
+  });
+
+  it("cron_add uses dynamic heredoc delimiter", async () => {
+    const tool = findTool(serviceTools, "openwrt_cron_add");
+    await tool.handler(client, { schedule: "0 2 * * *", command: "/root/backup.sh" });
+
+    const cronCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("| crontab -")
+    );
+    expect(cronCall).toBeDefined();
+    expect(cronCall!.args[0]).toContain("EOFMCP");
+  });
+
+  it("cron_add avoids delimiter collision", async () => {
+    // Mock crontab -l to return content containing EOFMCP
+    (client as any).executeCommand = vi.fn(async (cmd: string) => {
+      client.calls.push({ method: "executeCommand", args: [cmd] });
+      if (cmd === "crontab -l") return "# existing\nEOFMCP\n0 1 * * * /old/job";
+      return "";
+    });
+
+    const tool = findTool(serviceTools, "openwrt_cron_add");
+    await tool.handler(client, { schedule: "0 2 * * *", command: "/root/backup.sh" });
+
+    const cronCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("crontab -") && !c.args[0].startsWith("crontab")
+    );
+    expect(cronCall).toBeDefined();
+    // Should use EOFMCP1 since content contains EOFMCP
+    expect(cronCall!.args[0]).toContain("EOFMCP1");
+  });
+
+  it("cron_remove uses dynamic heredoc delimiter", async () => {
+    (client as any).executeCommand = vi.fn(async (cmd: string) => {
+      client.calls.push({ method: "executeCommand", args: [cmd] });
+      if (cmd === "crontab -l") return "0 1 * * * /old/job\n0 2 * * * /remove/this";
+      return "";
+    });
+
+    const tool = findTool(serviceTools, "openwrt_cron_remove");
+    const result = await tool.handler(client, { pattern: "/remove/this", confirm: true });
+    expect(result.success).toBe(true);
+
+    const cronCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("crontab -") && c.args[0].includes("EOFMCP")
+    );
+    expect(cronCall).toBeDefined();
+    // Removed entry should not be in the new crontab
+    expect(cronCall!.args[0]).not.toContain("/remove/this");
+    expect(cronCall!.args[0]).toContain("/old/job");
   });
 });
 
@@ -336,6 +404,17 @@ describe("WireGuard tools", () => {
       tool.handler(client, { interface: "../bad", peer_name: "client1" })
     ).rejects.toThrow("Invalid interface name");
   });
+
+  it("remove_peer uses shellQuote for uci delete", async () => {
+    const tool = findTool(wireguardTools, "openwrt_wireguard_remove_peer");
+    await tool.handler(client, { interface: "wg0", peer_name: "client1" });
+
+    const deleteCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("uci delete")
+    );
+    expect(deleteCall).toBeDefined();
+    expect(deleteCall!.args[0]).toBe("uci delete 'network.wg0_client1'");
+  });
 });
 
 describe("DNS tools", () => {
@@ -355,6 +434,39 @@ describe("DNS tools", () => {
     expect(addListCalls).toHaveLength(2);
     expect(addListCalls[0].args[0]).toContain("'8.8.8.8'");
     expect(addListCalls[1].args[0]).toContain("'1.1.1.1'");
+  });
+
+  it("add_static_host validates entry name", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_add_static_host");
+    await expect(
+      tool.handler(client, { name: "bad;name", hostname: "test.local", ip: "1.2.3.4" })
+    ).rejects.toThrow("Invalid entry name");
+  });
+
+  it("add_static_host with valid name succeeds", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_add_static_host");
+    const result = await tool.handler(client, { name: "myhost", hostname: "test.local", ip: "1.2.3.4" });
+    expect(result.success).toBe(true);
+  });
+
+  it("add_cname validates entry name", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_add_cname");
+    await expect(
+      tool.handler(client, { name: "$(cmd)", cname: "www.local", target: "server.local" })
+    ).rejects.toThrow("Invalid entry name");
+  });
+
+  it("add_static_lease validates entry name", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_add_static_lease");
+    await expect(
+      tool.handler(client, { name: "../etc", mac: "aa:bb:cc:dd:ee:ff", ip: "1.2.3.4" })
+    ).rejects.toThrow("Invalid entry name");
+  });
+
+  it("add_static_lease with valid name succeeds", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_add_static_lease");
+    const result = await tool.handler(client, { name: "myhost", mac: "aa:bb:cc:dd:ee:ff", ip: "1.2.3.4" });
+    expect(result.success).toBe(true);
   });
 });
 
