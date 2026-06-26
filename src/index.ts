@@ -43,7 +43,11 @@ if (!privateKey && process.env.OPENWRT_PRIVATE_KEY_FILE) {
   }
 }
 
-// Read configuration from environment variables
+// Read configuration from environment variables.
+// Note: OPENWRT_PASSWORD may legitimately be an empty string (e.g. a router
+// booted from NAND with no root password), so we treat "defined" as "provided"
+// rather than relying on truthiness.
+const hasPassword = process.env.OPENWRT_PASSWORD !== undefined;
 const config = {
   host: process.env.OPENWRT_HOST || "192.168.1.1",
   port: parseInt(process.env.OPENWRT_PORT || "22"),
@@ -53,7 +57,7 @@ const config = {
 };
 
 // Validate configuration
-if (!config.password && !config.privateKey) {
+if (!hasPassword && !config.privateKey) {
   console.error("Error: Either OPENWRT_PASSWORD, OPENWRT_PRIVATE_KEY, or OPENWRT_PRIVATE_KEY_FILE must be set");
   process.exit(1);
 }
