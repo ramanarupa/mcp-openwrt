@@ -36,3 +36,9 @@ id_rsa*
 /CLAUDE.md
 
 /.claude/
+/internal-docs/
+/scripts-backup/
+/.mcp.json.backup
+/.omc/sessions/
+/.omc/state/
+/.omc/project-memory.json
