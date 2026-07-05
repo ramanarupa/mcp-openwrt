@@ -48,9 +48,14 @@ if (!privateKey && process.env.OPENWRT_PRIVATE_KEY_FILE) {
 // booted from NAND with no root password), so we treat "defined" as "provided"
 // rather than relying on truthiness.
 const hasPassword = process.env.OPENWRT_PASSWORD !== undefined;
+const port = parseInt(process.env.OPENWRT_PORT || "22", 10);
+if (Number.isNaN(port) || port < 1 || port > 65535) {
+  console.error(`Error: Invalid OPENWRT_PORT: ${JSON.stringify(process.env.OPENWRT_PORT)}`);
+  process.exit(1);
+}
 const config = {
   host: process.env.OPENWRT_HOST || "192.168.1.1",
-  port: parseInt(process.env.OPENWRT_PORT || "22"),
+  port,
   username: process.env.OPENWRT_USERNAME || "root",
   password: process.env.OPENWRT_PASSWORD,
   privateKey,
@@ -252,18 +257,20 @@ process.on("SIGTERM", shutdown);
 
 // Start server
 async function main() {
-  // Connect to OpenWRT on startup
+  // Start the MCP transport first so the handshake isn't delayed by SSH
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("OpenWRT MCP server running on stdio");
+
+  // Connect to OpenWRT eagerly, but don't die if the router is temporarily
+  // unreachable — ensureConnected() retries on the first tool call
   try {
     await openwrtClient.connect();
     console.error("Connected to OpenWRT device");
   } catch (error) {
-    console.error("Failed to connect to OpenWRT:", error);
-    process.exit(1);
+    const msg = error instanceof Error ? error.message : String(error);
+    console.error(`Warning: initial connection to OpenWRT failed (${msg}); will retry on first tool call`);
   }
-
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error("OpenWRT MCP server running on stdio");
 }
 
 main().catch((error) => {

@@ -13,7 +13,11 @@ let lastMockClient: any = null;
 
 class MockStream extends EventEmitter {
   stderr = new EventEmitter();
+  written: string | undefined = undefined;
   close() {}
+  end(data?: string) {
+    this.written = data;
+  }
 }
 
 // Mock the ssh2 module before importing OpenWRTClient
@@ -172,8 +176,49 @@ describe("OpenWRTClient", () => {
 
       const client = makeClient();
       await client.connect();
-      await expect(client.executeCommand("sleep 100", 50)).rejects.toThrow("timed out");
+      await expect(client.executeCommand("sleep 100", { timeout: 50 })).rejects.toThrow("timed out");
       expect(streamRef!.close).toHaveBeenCalled();
+    });
+
+    it("rejects when channel closes without exit code and marks disconnected", async () => {
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (_cmd, cb) => {
+          const stream = new MockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            // Connection drop: close event without an exit status
+            stream.emit("close", null);
+          });
+        },
+      };
+
+      const client = makeClient();
+      await client.connect();
+      await expect(client.executeCommand("reboot")).rejects.toThrow(
+        "closed without exit code"
+      );
+      expect((client as any).connected).toBe(false);
+    });
+
+    it("streams stdin to the command when provided", async () => {
+      let streamRef: MockStream | null = null;
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (_cmd, cb) => {
+          const stream = new MockStream();
+          streamRef = stream;
+          cb(null, stream);
+          process.nextTick(() => {
+            stream.emit("close", 0);
+          });
+        },
+      };
+
+      const client = makeClient();
+      await client.connect();
+      await client.executeCommand("cat > /tmp/x", { stdin: "payload" });
+      expect(streamRef!.written).toBe("payload");
     });
   });
 
@@ -224,47 +269,52 @@ describe("OpenWRTClient", () => {
   });
 
   describe("writeFile()", () => {
-    it("uses dynamic heredoc delimiter", async () => {
-      let capturedCommand = "";
+    function captureWrite() {
+      const captured = { command: "", stream: null as MockStream | null };
       nextBehavior = {
         connectAction: "ready",
         execHandler: (cmd, cb) => {
-          capturedCommand = cmd;
+          captured.command = cmd;
           const stream = new MockStream();
+          captured.stream = stream;
           cb(null, stream);
           process.nextTick(() => {
             stream.emit("close", 0);
           });
         },
       };
+      return captured;
+    }
+
+    it("streams content to stdin of cat with quoted path", async () => {
+      const captured = captureWrite();
 
       const client = makeClient();
       await client.connect();
       await client.writeFile("/tmp/test", "hello world");
 
-      expect(capturedCommand).toContain("EOFMCP");
-      expect(capturedCommand).toContain("'/tmp/test'");
+      expect(captured.command).toBe("cat > '/tmp/test'");
+      expect(captured.stream!.written).toBe("hello world");
     });
 
-    it("uses alternate delimiter when content contains EOFMCP", async () => {
-      let capturedCommand = "";
-      nextBehavior = {
-        connectAction: "ready",
-        execHandler: (cmd, cb) => {
-          capturedCommand = cmd;
-          const stream = new MockStream();
-          cb(null, stream);
-          process.nextTick(() => {
-            stream.emit("close", 0);
-          });
-        },
-      };
+    it("writes content byte-for-byte without adding a trailing newline", async () => {
+      const captured = captureWrite();
 
       const client = makeClient();
       await client.connect();
-      await client.writeFile("/tmp/test", "line1\nEOFMCP\nline3");
+      await client.writeFile("/tmp/test", "no trailing newline");
 
-      expect(capturedCommand).toContain("EOFMCP1");
+      expect(captured.stream!.written).toBe("no trailing newline");
+    });
+
+    it("does not double a trailing newline that is already present", async () => {
+      const captured = captureWrite();
+
+      const client = makeClient();
+      await client.connect();
+      await client.writeFile("/tmp/test", "line1\nline2\n");
+
+      expect(captured.stream!.written).toBe("line1\nline2\n");
     });
   });
 

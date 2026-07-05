@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateName } from "../utils.js";
+import { shellQuote, validateUciSectionName } from "../utils.js";
 
 export const dnsTools: Tool[] = [
   {
@@ -37,20 +37,27 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const servers = args.servers as string[];
 
-      // Delete existing DNS server list
       try {
-        await client.executeCommand("uci delete dhcp.@dnsmasq[0].server");
+        // Delete existing DNS server list
+        try {
+          await client.executeCommand("uci delete dhcp.@dnsmasq[0].server");
+        } catch (error) {
+          // Ignore if list doesn't exist yet
+        }
+
+        // Add new DNS servers via list
+        for (const server of servers) {
+          await client.executeCommand(`uci add_list dhcp.@dnsmasq[0].server=${shellQuote(server)}`);
+        }
+
+        await client.uciCommit("dhcp");
       } catch (error) {
-        // Ignore if list doesn't exist yet
+        // Don't leave staged changes behind — they'd be silently picked up
+        // by the next `uci commit dhcp` from an unrelated tool call
+        await client.uciRevert("dhcp");
+        throw error;
       }
 
-      // Add new DNS servers via list
-      for (const server of servers) {
-        await client.executeCommand(`uci add_list dhcp.@dnsmasq[0].server=${shellQuote(server)}`);
-      }
-
-      // Commit and reload
-      await client.uciCommit("dhcp");
       await client.reloadDnsmasq();
 
       return {
@@ -84,7 +91,7 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, hostname, ip } = args;
 
-      validateName(name, "entry name");
+      validateUciSectionName(name, "entry name");
 
       try {
         // Create new domain section
@@ -132,7 +139,7 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, cname, target } = args;
 
-      validateName(name, "entry name");
+      validateUciSectionName(name, "entry name");
 
       try {
         // Create new cname section
@@ -184,7 +191,7 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { interface: iface, start, limit, leasetime } = args;
 
-      validateName(iface, "interface name");
+      validateUciSectionName(iface, "interface name");
 
       try {
         // Configure DHCP pool
@@ -237,7 +244,7 @@ export const dnsTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, mac, ip, hostname } = args;
 
-      validateName(name, "entry name");
+      validateUciSectionName(name, "entry name");
 
       try {
         // Create new host section

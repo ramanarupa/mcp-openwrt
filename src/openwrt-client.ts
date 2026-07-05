@@ -1,5 +1,5 @@
 import { Client, ClientChannel } from "ssh2";
-import { shellQuote, validateName, uniqueHeredocDelimiter } from "./utils.js";
+import { shellQuote, validateName } from "./utils.js";
 
 const DEFAULT_COMMAND_TIMEOUT = 30_000; // 30 seconds
 
@@ -9,6 +9,13 @@ export interface OpenWRTConfig {
   username: string;
   password?: string;
   privateKey?: string;
+}
+
+export interface ExecuteOptions {
+  /** Command timeout in ms (default 30s). */
+  timeout?: number;
+  /** If set, this string is streamed to the command's stdin and the channel is closed (EOF). */
+  stdin?: string;
 }
 
 export class OpenWRTClient {
@@ -85,7 +92,8 @@ export class OpenWRTClient {
     }
   }
 
-  async executeCommand(command: string, timeout: number = DEFAULT_COMMAND_TIMEOUT): Promise<string> {
+  async executeCommand(command: string, options: ExecuteOptions = {}): Promise<string> {
+    const { timeout = DEFAULT_COMMAND_TIMEOUT, stdin } = options;
     await this.ensureConnected();
 
     return new Promise((resolve, reject) => {
@@ -121,14 +129,22 @@ export class OpenWRTClient {
         let stderr = "";
 
         stream
-          .on("close", (code: number) => {
+          .on("close", (code: number | null) => {
             if (!settled) {
               settled = true;
               clearTimeout(timer);
-              if (code !== 0) {
-                reject(new Error(`Command failed with code ${code}: ${stderr}`));
-              } else {
+              if (code === 0) {
                 resolve(stdout);
+              } else if (code === null || code === undefined) {
+                // Channel closed without an exit status — usually a dropped connection
+                this.connected = false;
+                reject(
+                  new Error(
+                    `Command channel closed without exit code (connection may have dropped): ${command.slice(0, 100)}`
+                  )
+                );
+              } else {
+                reject(new Error(`Command failed with code ${code}: ${stderr}`));
               }
             }
           })
@@ -138,6 +154,11 @@ export class OpenWRTClient {
           .stderr.on("data", (data: Buffer) => {
             stderr += data.toString();
           });
+
+        // Stream stdin content and signal EOF so commands like `cat > file` terminate
+        if (stdin !== undefined) {
+          stream.end(stdin);
+        }
       });
     });
   }
@@ -256,13 +277,13 @@ export class OpenWRTClient {
   }
 
   /**
-   * Write content to a file on the OpenWRT device
+   * Write content to a file on the OpenWRT device.
+   * Content is streamed to stdin of `cat`, so the file is written
+   * byte-for-byte (a heredoc would force an extra trailing newline).
    * @param path - file path
    * @param content - content to write
    */
   async writeFile(path: string, content: string): Promise<void> {
-    const delimiter = uniqueHeredocDelimiter(content);
-    const command = `cat > ${shellQuote(path)} << '${delimiter}'\n${content}\n${delimiter}`;
-    await this.executeCommand(command);
+    await this.executeCommand(`cat > ${shellQuote(path)}`, { stdin: content });
   }
 }

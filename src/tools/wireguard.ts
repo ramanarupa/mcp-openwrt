@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateName } from "../utils.js";
+import { shellQuote, validateUciSectionName, extractWireguardConfig } from "../utils.js";
 
 export const wireguardTools: Tool[] = [
   {
@@ -58,7 +58,7 @@ export const wireguardTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, private_key, listen_port, addresses } = args;
 
-      validateName(name, "interface name");
+      validateUciSectionName(name, "interface name");
 
       // Generate private key if not provided
       let privateKey = private_key;
@@ -153,8 +153,8 @@ export const wireguardTools: Tool[] = [
         preshared_key,
       } = args;
 
-      validateName(iface, "interface name");
-      validateName(peer_name, "peer name");
+      validateUciSectionName(iface, "interface name");
+      validateUciSectionName(peer_name, "peer name");
 
       // Create peer section
       const peerSection = `${iface}_${peer_name}`;
@@ -169,11 +169,16 @@ export const wireguardTools: Tool[] = [
 
         // Optional parameters
         if (endpoint) {
-          const parts = endpoint.split(":");
-          const host = parts.slice(0, -1).join(":");
-          const port = parts[parts.length - 1];
-          await client.uciSet("network", peerSection, "endpoint_host", host);
-          await client.uciSet("network", peerSection, "endpoint_port", port);
+          // Supports host:port, v4:port and [v6]:port (brackets stripped for UCI)
+          const match =
+            endpoint.match(/^\[([^\]]+)\]:(\d+)$/) || endpoint.match(/^(.+):(\d+)$/);
+          if (!match) {
+            throw new Error(
+              `Invalid endpoint: ${JSON.stringify(endpoint)}. Expected "host:port" or "[ipv6]:port".`
+            );
+          }
+          await client.uciSet("network", peerSection, "endpoint_host", match[1]);
+          await client.uciSet("network", peerSection, "endpoint_port", match[2]);
         }
 
         if (persistent_keepalive) {
@@ -231,12 +236,12 @@ export const wireguardTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { interface: iface, peer_name } = args;
 
-      validateName(iface, "interface name");
-      validateName(peer_name, "peer name");
+      validateUciSectionName(iface, "interface name");
+      validateUciSectionName(peer_name, "peer name");
 
       const peerSection = `${iface}_${peer_name}`;
 
-      // Delete peer section (peerSection is built from validateName-checked parts)
+      // Delete peer section (peerSection is built from validateUciSectionName-checked parts)
       await client.executeCommand(`uci delete ${shellQuote(`network.${peerSection}`)}`);
 
       // Commit and reload
@@ -271,7 +276,7 @@ export const wireguardTools: Tool[] = [
   },
   {
     name: "openwrt_wireguard_show_config",
-    description: "Show the current WireGuard configuration from UCI",
+    description: "Show the current WireGuard configuration from UCI (private/preshared keys are redacted)",
     inputSchema: {
       type: "object",
       properties: {},
@@ -279,13 +284,11 @@ export const wireguardTools: Tool[] = [
     handler: async (client: OpenWRTClient) => {
       try {
         const config = await client.uciShow("network");
-        // Filter WireGuard-related configuration (includes wg interface lines)
-        const lines = config.split("\n").filter(
-          (line) => line.includes("wireguard") || /^network\.wg\d+\./.test(line)
-        );
+        // Sections with proto='wireguard' plus their peers, keys redacted
+        const filtered = extractWireguardConfig(config);
         return {
           success: true,
-          configuration: lines.join("\n"),
+          configuration: filtered || "No WireGuard configuration found",
         };
       } catch (error) {
         return {

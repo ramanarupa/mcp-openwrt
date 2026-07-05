@@ -4,6 +4,9 @@ import { shellQuote, validateName } from "../utils.js";
 
 const VALID_SERVICE_ACTIONS = ["start", "stop", "restart", "reload", "enable", "disable", "status"] as const;
 
+// apk over a slow uplink can easily exceed the default 30s command timeout
+const PACKAGE_TIMEOUT = 120_000;
+
 export const systemTools: Tool[] = [
   {
     name: "openwrt_system_info",
@@ -117,11 +120,24 @@ export const systemTools: Tool[] = [
         ? `apk list --installed | grep -F -- ${shellQuote(filter)}`
         : "apk list --installed";
 
-      const output = await client.executeCommand(command);
-      return {
-        success: true,
-        packages: output,
-      };
+      try {
+        const output = await client.executeCommand(command);
+        return {
+          success: true,
+          packages: output,
+        };
+      } catch (error) {
+        // grep exits with code 1 when the filter matches nothing — not an error
+        const errorMsg = error instanceof Error ? error.message : String(error);
+        if (filter && errorMsg.includes("code 1")) {
+          return {
+            success: true,
+            packages: "",
+            message: "No installed packages match the filter",
+          };
+        }
+        throw error;
+      }
     },
   },
   {
@@ -141,10 +157,10 @@ export const systemTools: Tool[] = [
       const { package: pkg } = args;
 
       // Update package list first
-      await client.executeCommand("apk update");
+      await client.executeCommand("apk update", { timeout: PACKAGE_TIMEOUT });
 
       // Install package
-      const output = await client.executeCommand(`apk add ${shellQuote(pkg)}`);
+      const output = await client.executeCommand(`apk add ${shellQuote(pkg)}`, { timeout: PACKAGE_TIMEOUT });
 
       return {
         success: true,
@@ -168,7 +184,7 @@ export const systemTools: Tool[] = [
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { package: pkg } = args;
-      const output = await client.executeCommand(`apk del ${shellQuote(pkg)}`);
+      const output = await client.executeCommand(`apk del ${shellQuote(pkg)}`, { timeout: PACKAGE_TIMEOUT });
 
       return {
         success: true,
@@ -218,7 +234,12 @@ export const systemTools: Tool[] = [
         throw new Error(`Invalid action: ${JSON.stringify(action)}. Must be one of: ${VALID_SERVICE_ACTIONS.join(", ")}`);
       }
 
-      const output = await client.executeCommand(`/etc/init.d/${service} ${action}`);
+      // `status` exits non-zero (e.g. 3) for stopped procd services — that's a
+      // report, not a failure. Merge stderr and mask the exit code for it.
+      const command = action === "status"
+        ? `/etc/init.d/${service} status 2>&1 || true`
+        : `/etc/init.d/${service} ${action}`;
+      const output = await client.executeCommand(command);
       return {
         success: true,
         message: `Service ${service} ${action} executed`,
@@ -249,7 +270,14 @@ export const systemTools: Tool[] = [
         };
       }
 
-      await client.executeCommand("reboot");
+      // Ensure we are actually connected before sending — a connect failure
+      // must propagate (device unreachable ≠ reboot succeeded)
+      await client.connect();
+      try {
+        await client.executeCommand("reboot");
+      } catch (error) {
+        // The SSH channel drops as the device goes down — that's expected
+      }
       return {
         success: true,
         message: "Reboot command sent. Device will restart shortly.",
@@ -266,7 +294,7 @@ export const systemTools: Tool[] = [
     handler: async (client: OpenWRTClient) => {
       const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
       const backupPath = `/tmp/backup-${timestamp}.tar.gz`;
-      await client.executeCommand(`sysupgrade -b ${shellQuote(backupPath)}`);
+      await client.executeCommand(`sysupgrade -b ${shellQuote(backupPath)}`, { timeout: PACKAGE_TIMEOUT });
 
       return {
         success: true,

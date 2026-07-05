@@ -14,8 +14,11 @@ function createMockClient() {
 
   return {
     calls,
-    executeCommand: vi.fn(async (cmd: string) => {
-      calls.push({ method: "executeCommand", args: [cmd] });
+    connect: vi.fn(async () => {
+      calls.push({ method: "connect", args: [] });
+    }),
+    executeCommand: vi.fn(async (cmd: string, options?: { timeout?: number; stdin?: string }) => {
+      calls.push({ method: "executeCommand", args: [cmd, options] });
       return "";
     }),
     ubusCall: vi.fn(async (path: string, method: string, params?: any) => {
@@ -30,6 +33,9 @@ function createMockClient() {
     }),
     uciCommit: vi.fn(async (config?: string) => {
       calls.push({ method: "uciCommit", args: [config] });
+    }),
+    uciRevert: vi.fn(async (config?: string) => {
+      calls.push({ method: "uciRevert", args: [config] });
     }),
     uciShow: vi.fn(async (config: string) => {
       calls.push({ method: "uciShow", args: [config] });
@@ -134,6 +140,18 @@ describe("File tools", () => {
 
     await expect(tool.handler(client, { path: "/nonexistent" })).rejects.toThrow("File not found");
   });
+
+  it("file_append streams content via stdin byte-for-byte", async () => {
+    const tool = findTool(fileTools, "openwrt_file_append");
+    await tool.handler(client, { path: "/tmp/test", content: "extra line" });
+
+    const appendCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].startsWith("cat >>")
+    );
+    expect(appendCall).toBeDefined();
+    expect(appendCall!.args[0]).toBe("cat >> '/tmp/test'");
+    expect(appendCall!.args[1]).toEqual({ stdin: "extra line" });
+  });
 });
 
 describe("System tools", () => {
@@ -221,6 +239,52 @@ describe("System tools", () => {
     expect(grepCall!.args[0]).toContain("-F --");
     expect(grepCall!.args[0]).toContain("'wire$guard'");
   });
+
+  it("package_list_installed returns empty result when filter matches nothing", async () => {
+    (client as any).executeCommand = vi.fn(async (cmd: string) => {
+      client.calls.push({ method: "executeCommand", args: [cmd] });
+      throw new Error("Command failed with code 1: ");
+    });
+
+    const tool = findTool(systemTools, "openwrt_package_list_installed");
+    const result = await tool.handler(client, { filter: "nonexistent" });
+    expect(result.success).toBe(true);
+    expect(result.packages).toBe("");
+  });
+
+  it("package_install uses an extended timeout", async () => {
+    const tool = findTool(systemTools, "openwrt_package_install");
+    await tool.handler(client, { package: "htop" });
+
+    const installCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("apk add")
+    );
+    expect(installCall!.args[1]?.timeout).toBeGreaterThan(30_000);
+  });
+
+  it("service_control status masks the non-zero exit code", async () => {
+    const tool = findTool(systemTools, "openwrt_service_control");
+    await tool.handler(client, { service: "dnsmasq", action: "status" });
+
+    const statusCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("status")
+    );
+    expect(statusCall).toBeDefined();
+    expect(statusCall!.args[0]).toBe("/etc/init.d/dnsmasq status 2>&1 || true");
+  });
+
+  it("system_reboot with confirm tolerates a dropped channel", async () => {
+    (client as any).executeCommand = vi.fn(async (cmd: string) => {
+      client.calls.push({ method: "executeCommand", args: [cmd] });
+      throw new Error("Command channel closed without exit code (connection may have dropped): reboot");
+    });
+
+    const tool = findTool(systemTools, "openwrt_system_reboot");
+    const result = await tool.handler(client, { confirm: true });
+    expect(result.success).toBe(true);
+    // connect() must run first so an unreachable device still fails properly
+    expect(client.calls.some((c) => c.method === "connect")).toBe(true);
+  });
 });
 
 describe("Service tools", () => {
@@ -268,22 +332,50 @@ describe("Service tools", () => {
     ).rejects.toThrow("Invalid service name");
   });
 
-  it("cron_add uses dynamic heredoc delimiter", async () => {
-    const tool = findTool(serviceTools, "openwrt_cron_add");
-    await tool.handler(client, { schedule: "0 2 * * *", command: "/root/backup.sh" });
+  it("service_create_simple generates a procd script with escaped command", async () => {
+    const tool = findTool(serviceTools, "openwrt_service_create_simple");
+    await tool.handler(client, { name: "myapp", start_command: "/usr/bin/myapp --flag" });
 
-    const cronCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0].includes("| crontab -")
-    );
-    expect(cronCall).toBeDefined();
-    expect(cronCall!.args[0]).toContain("EOFMCP");
+    const writeCall = client.calls.find((c) => c.method === "writeFile");
+    expect(writeCall).toBeDefined();
+    const script = writeCall!.args[1];
+    expect(script).toContain("USE_PROCD=1");
+    expect(script).toContain("procd_set_param command /bin/sh -c '/usr/bin/myapp --flag'");
+    expect(script).toContain("procd_set_param respawn");
+    // No custom stop_command — procd handles stop itself
+    expect(script).not.toContain("stop_service()");
   });
 
-  it("cron_add avoids delimiter collision", async () => {
-    // Mock crontab -l to return content containing EOFMCP
-    (client as any).executeCommand = vi.fn(async (cmd: string) => {
-      client.calls.push({ method: "executeCommand", args: [cmd] });
-      if (cmd === "crontab -l") return "# existing\nEOFMCP\n0 1 * * * /old/job";
+  it("service_create_simple includes stop_service when stop_command given", async () => {
+    const tool = findTool(serviceTools, "openwrt_service_create_simple");
+    await tool.handler(client, {
+      name: "myapp",
+      start_command: "/usr/bin/myapp",
+      stop_command: "rm -f /tmp/myapp.lock",
+    });
+
+    const writeCall = client.calls.find((c) => c.method === "writeFile");
+    expect(writeCall!.args[1]).toContain("stop_service()");
+    expect(writeCall!.args[1]).toContain("rm -f /tmp/myapp.lock");
+  });
+
+  it("cron_add writes the crontab via stdin with trailing newline", async () => {
+    const tool = findTool(serviceTools, "openwrt_cron_add");
+    await tool.handler(client, { schedule: "0 2 * * *", command: "/root/backup.sh", comment: "nightly" });
+
+    const cronCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0] === "crontab -"
+    );
+    expect(cronCall).toBeDefined();
+    const stdin = cronCall!.args[1].stdin as string;
+    expect(stdin).toContain("# nightly\n0 2 * * * /root/backup.sh");
+    expect(stdin.endsWith("\n")).toBe(true);
+  });
+
+  it("cron_add appends to an existing crontab", async () => {
+    (client as any).executeCommand = vi.fn(async (cmd: string, options?: any) => {
+      client.calls.push({ method: "executeCommand", args: [cmd, options] });
+      if (cmd === "crontab -l") return "0 1 * * * /old/job\n";
       return "";
     });
 
@@ -291,31 +383,56 @@ describe("Service tools", () => {
     await tool.handler(client, { schedule: "0 2 * * *", command: "/root/backup.sh" });
 
     const cronCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0].includes("crontab -") && !c.args[0].startsWith("crontab")
+      (c) => c.method === "executeCommand" && c.args[0] === "crontab -"
     );
-    expect(cronCall).toBeDefined();
-    // Should use EOFMCP1 since content contains EOFMCP
-    expect(cronCall!.args[0]).toContain("EOFMCP1");
+    expect(cronCall!.args[1].stdin).toBe("0 1 * * * /old/job\n0 2 * * * /root/backup.sh\n");
   });
 
-  it("cron_remove uses dynamic heredoc delimiter", async () => {
+  it("cron_list treats busybox 'can't open' error as empty crontab", async () => {
     (client as any).executeCommand = vi.fn(async (cmd: string) => {
       client.calls.push({ method: "executeCommand", args: [cmd] });
-      if (cmd === "crontab -l") return "0 1 * * * /old/job\n0 2 * * * /remove/this";
+      if (cmd === "crontab -l") {
+        throw new Error("Command failed with code 1: crontab: can't open 'root': No such file or directory");
+      }
+      return "";
+    });
+
+    const tool = findTool(serviceTools, "openwrt_cron_list");
+    const result = await tool.handler(client, {});
+    expect(result.success).toBe(true);
+    expect(result.crontab).toBe("");
+  });
+
+  it("cron_remove filters entries and their comment lines via stdin", async () => {
+    (client as any).executeCommand = vi.fn(async (cmd: string, options?: any) => {
+      client.calls.push({ method: "executeCommand", args: [cmd, options] });
+      if (cmd === "crontab -l") {
+        return "# keep this\n0 1 * * * /old/job\n# remove me\n0 2 * * * /remove/this";
+      }
       return "";
     });
 
     const tool = findTool(serviceTools, "openwrt_cron_remove");
     const result = await tool.handler(client, { pattern: "/remove/this", confirm: true });
     expect(result.success).toBe(true);
+    expect(result.message).toContain("1 cron job(s) removed");
 
     const cronCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0].includes("crontab -") && c.args[0].includes("EOFMCP")
+      (c) => c.method === "executeCommand" && c.args[0] === "crontab -"
     );
     expect(cronCall).toBeDefined();
-    // Removed entry should not be in the new crontab
-    expect(cronCall!.args[0]).not.toContain("/remove/this");
-    expect(cronCall!.args[0]).toContain("/old/job");
+    const stdin = cronCall!.args[1].stdin as string;
+    expect(stdin).not.toContain("/remove/this");
+    expect(stdin).not.toContain("# remove me");
+    expect(stdin).toContain("/old/job");
+    expect(stdin).toContain("# keep this");
+  });
+
+  it("cron_remove rejects an empty pattern", async () => {
+    const tool = findTool(serviceTools, "openwrt_cron_remove");
+    await expect(tool.handler(client, { pattern: "", confirm: true })).rejects.toThrow(
+      "non-empty"
+    );
   });
 });
 
@@ -415,6 +532,73 @@ describe("WireGuard tools", () => {
     expect(deleteCall).toBeDefined();
     expect(deleteCall!.args[0]).toBe("uci delete 'network.wg0_client1'");
   });
+
+  it("add_peer rejects hyphenated peer names (invalid UCI section)", async () => {
+    const tool = findTool(wireguardTools, "openwrt_wireguard_add_peer");
+    await expect(
+      tool.handler(client, {
+        interface: "wg0",
+        peer_name: "my-peer",
+        public_key: "key",
+        allowed_ips: ["10.0.0.2/32"],
+      })
+    ).rejects.toThrow("Invalid peer name");
+  });
+
+  it("add_peer parses bracketed IPv6 endpoints", async () => {
+    const tool = findTool(wireguardTools, "openwrt_wireguard_add_peer");
+    await tool.handler(client, {
+      interface: "wg0",
+      peer_name: "client1",
+      public_key: "key123",
+      allowed_ips: ["10.0.0.2/32"],
+      endpoint: "[2001:db8::1]:51820",
+    });
+
+    const hostCall = client.calls.find(
+      (c) => c.method === "uciSet" && c.args[2] === "endpoint_host"
+    );
+    const portCall = client.calls.find(
+      (c) => c.method === "uciSet" && c.args[2] === "endpoint_port"
+    );
+    expect(hostCall!.args[3]).toBe("2001:db8::1");
+    expect(portCall!.args[3]).toBe("51820");
+  });
+
+  it("add_peer rejects an endpoint without a port and reverts staged changes", async () => {
+    const tool = findTool(wireguardTools, "openwrt_wireguard_add_peer");
+    await expect(
+      tool.handler(client, {
+        interface: "wg0",
+        peer_name: "client1",
+        public_key: "key123",
+        allowed_ips: ["10.0.0.2/32"],
+        endpoint: "example.com",
+      })
+    ).rejects.toThrow("Invalid endpoint");
+    expect(client.calls.some((c) => c.method === "uciRevert" && c.args[0] === "network")).toBe(true);
+  });
+
+  it("show_config redacts private keys and covers non-numeric interface names", async () => {
+    (client as any).uciShow = vi.fn(async () => {
+      return [
+        "network.lan=interface",
+        "network.lan.proto='static'",
+        "network.wg_vps=interface",
+        "network.wg_vps.proto='wireguard'",
+        "network.wg_vps.private_key='SUPERSECRET='",
+        "network.wg_vps.listen_port='10810'",
+      ].join("\n");
+    });
+
+    const tool = findTool(wireguardTools, "openwrt_wireguard_show_config");
+    const result = await tool.handler(client, {});
+    expect(result.success).toBe(true);
+    expect(result.configuration).not.toContain("SUPERSECRET");
+    expect(result.configuration).toContain("private_key='<redacted>'");
+    expect(result.configuration).toContain("network.wg_vps.listen_port='10810'");
+    expect(result.configuration).not.toContain("network.lan");
+  });
 });
 
 describe("DNS tools", () => {
@@ -467,6 +651,28 @@ describe("DNS tools", () => {
     const tool = findTool(dnsTools, "openwrt_dns_add_static_lease");
     const result = await tool.handler(client, { name: "myhost", mac: "aa:bb:cc:dd:ee:ff", ip: "1.2.3.4" });
     expect(result.success).toBe(true);
+  });
+
+  it("add_static_lease rejects hyphenated names (invalid UCI section)", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_add_static_lease");
+    await expect(
+      tool.handler(client, { name: "my-host", mac: "aa:bb:cc:dd:ee:ff", ip: "1.2.3.4" })
+    ).rejects.toThrow("Invalid entry name");
+  });
+
+  it("set_upstream_servers reverts staged changes on failure", async () => {
+    (client as any).executeCommand = vi.fn(async (cmd: string) => {
+      client.calls.push({ method: "executeCommand", args: [cmd] });
+      if (cmd.includes("uci add_list")) {
+        throw new Error("uci: I/O error");
+      }
+      return "";
+    });
+
+    const tool = findTool(dnsTools, "openwrt_dns_set_upstream_servers");
+    await expect(tool.handler(client, { servers: ["8.8.8.8"] })).rejects.toThrow("I/O error");
+    expect(client.calls.some((c) => c.method === "uciRevert" && c.args[0] === "dhcp")).toBe(true);
+    expect(client.calls.some((c) => c.method === "reloadDnsmasq")).toBe(false);
   });
 });
 
@@ -559,6 +765,17 @@ describe("Script tools", () => {
     );
     expect(execCall).toBeDefined();
     expect(execCall!.args[0]).toBe("'/root/test.sh' -v --flag");
+  });
+
+  it("script_execute background uses nohup with output redirect", async () => {
+    const tool = findTool(scriptTools, "openwrt_script_execute");
+    await tool.handler(client, { path: "/root/test.sh", background: true });
+
+    const execCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("test.sh")
+    );
+    expect(execCall).toBeDefined();
+    expect(execCall!.args[0]).toBe("nohup '/root/test.sh' >/dev/null 2>&1 &");
   });
 
   it("script_list uses find instead of ls glob", async () => {

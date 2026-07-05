@@ -91,15 +91,19 @@ export const scriptTools: Tool[] = [
       const { path, args: scriptArgs = "", background = false } = args;
 
       // path is quoted; scriptArgs is intentionally raw (user-supplied shell args)
+      const argsSuffix = scriptArgs ? ` ${scriptArgs}` : "";
+      // Background: nohup + redirect, otherwise the SSH channel stays open
+      // (held by the child's stdout/stderr) until the script exits anyway
       const command = background
-        ? `${shellQuote(path)} ${scriptArgs} &`
-        : `${shellQuote(path)} ${scriptArgs}`;
+        ? `nohup ${shellQuote(path)}${argsSuffix} >/dev/null 2>&1 &`
+        : `${shellQuote(path)}${argsSuffix}`;
       const output = await client.executeCommand(command);
 
       return {
         success: true,
         output,
         background,
+        ...(background ? { note: "Script detached; its output is discarded (>/dev/null)" } : {}),
       };
     },
   },
@@ -211,8 +215,11 @@ fi
       validateName(name, "script name");
 
       const escapedLogFile = shellEscape(log_file);
+      // Always log; sendmail is not part of a default OpenWrt install, so
+      // guard the email path behind a command -v check instead of failing
       const emailAlert = email
-        ? `echo "$MESSAGE" | sendmail ${shellEscape(email)}`
+        ? `echo "$MESSAGE" >> "$LOG_FILE"
+    command -v sendmail >/dev/null 2>&1 && echo "$MESSAGE" | sendmail '${shellEscape(email)}'`
         : `echo "$MESSAGE" >> "$LOG_FILE"`;
 
       const scriptContent = `#!/bin/sh
@@ -252,7 +259,7 @@ if [ "$DISK_USAGE" -gt 90 ]; then
 fi
 
 # Log current status
-echo "$(date): CPU=$CPU_LOAD MEM=$MEM_USAGE% DISK=$DISK_USAGE%" >> $LOG_FILE
+echo "$(date): CPU=$CPU_LOAD MEM=$MEM_USAGE% DISK=$DISK_USAGE%" >> "$LOG_FILE"
 `;
 
       const scriptPath = `/root/${name}`;

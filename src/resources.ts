@@ -1,4 +1,5 @@
 import { OpenWRTClient } from "./openwrt-client.js";
+import { extractWireguardConfig } from "./utils.js";
 
 export interface Resource {
   uri: string;
@@ -62,12 +63,11 @@ export const resources: Resource[] = [
     handler: async (client: OpenWRTClient) => {
       try {
         const uciConfig = await client.uciShow("network");
-        const wgLines = uciConfig
-          .split("\n")
-          .filter((line) => line.includes("wireguard") || /^network\.wg\d+\./.test(line));
+        // Sections with proto='wireguard' plus their peers, keys redacted
+        const wgConfig = extractWireguardConfig(uciConfig);
 
         let result = "=== UCI WireGuard Config ===\n";
-        result += wgLines.length > 0 ? wgLines.join("\n") : "No WireGuard UCI configuration found";
+        result += wgConfig || "No WireGuard UCI configuration found";
 
         try {
           const wgStatus = await client.executeCommand("wg show all");

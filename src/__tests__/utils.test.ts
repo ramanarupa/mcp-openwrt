@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { shellQuote, validateName, validateMode, uniqueHeredocDelimiter } from "../utils.js";
+import {
+  shellQuote,
+  validateName,
+  validateUciSectionName,
+  validateMode,
+  extractWireguardConfig,
+} from "../utils.js";
 
 describe("shellQuote", () => {
   it("wraps simple strings in single quotes", () => {
@@ -133,21 +139,84 @@ describe("validateMode", () => {
   });
 });
 
-describe("uniqueHeredocDelimiter", () => {
-  it("returns EOFMCP when content has no collision", () => {
-    expect(uniqueHeredocDelimiter("some content here")).toBe("EOFMCP");
+describe("validateUciSectionName", () => {
+  it("accepts letters, digits, and underscores", () => {
+    expect(() => validateUciSectionName("wg0", "test")).not.toThrow();
+    expect(() => validateUciSectionName("wg_vps", "test")).not.toThrow();
+    expect(() => validateUciSectionName("lan_2", "test")).not.toThrow();
   });
 
-  it("returns EOFMCP1 when content contains EOFMCP on a line", () => {
-    expect(uniqueHeredocDelimiter("line1\nEOFMCP\nline3")).toBe("EOFMCP1");
+  it("rejects hyphens (invalid in UCI section names)", () => {
+    expect(() => validateUciSectionName("my-host", "entry name")).toThrow("Invalid entry name");
   });
 
-  it("returns EOFMCP2 when content contains both EOFMCP and EOFMCP1", () => {
-    expect(uniqueHeredocDelimiter("EOFMCP\nEOFMCP1\nline3")).toBe("EOFMCP2");
+  it("rejects dots (would misparse the UCI path)", () => {
+    expect(() => validateUciSectionName("a.b", "test")).toThrow("Invalid test");
   });
 
-  it("does not collide with EOFMCP as substring", () => {
-    // "someEOFMCPtext" is a line that does NOT equal "EOFMCP", so no collision
-    expect(uniqueHeredocDelimiter("someEOFMCPtext")).toBe("EOFMCP");
+  it("rejects spaces, empty strings, and shell metacharacters", () => {
+    expect(() => validateUciSectionName("a b", "test")).toThrow("Invalid test");
+    expect(() => validateUciSectionName("", "test")).toThrow("Invalid test");
+    expect(() => validateUciSectionName("$(cmd)", "test")).toThrow("Invalid test");
+    expect(() => validateUciSectionName("../etc", "test")).toThrow("Invalid test");
+  });
+
+  it("includes label in error message", () => {
+    expect(() => validateUciSectionName("bad-name", "route name")).toThrow("Invalid route name");
+  });
+});
+
+describe("extractWireguardConfig", () => {
+  const sample = [
+    "network.lan=interface",
+    "network.lan.proto='static'",
+    "network.lan.ipaddr='192.168.108.1'",
+    "network.wg_vps=interface",
+    "network.wg_vps.proto='wireguard'",
+    "network.wg_vps.private_key='SUPERSECRET='",
+    "network.wg_vps.listen_port='10810'",
+    "network.wg0=interface",
+    "network.wg0.proto='wireguard'",
+    "network.wg0.private_key='SECRET2='",
+    "network.wg0_peer1=wireguard_wg0",
+    "network.wg0_peer1.public_key='PUBKEY='",
+    "network.wg0_peer1.preshared_key='PSK='",
+    "network.@wireguard_wg_vps[0]=wireguard_wg_vps",
+    "network.@wireguard_wg_vps[0].public_key='PUBKEY2='",
+  ].join("\n");
+
+  it("includes interfaces with proto=wireguard regardless of name (wg_vps, wg0)", () => {
+    const result = extractWireguardConfig(sample);
+    expect(result).toContain("network.wg_vps.listen_port='10810'");
+    expect(result).toContain("network.wg0.proto='wireguard'");
+  });
+
+  it("includes named and anonymous peer sections", () => {
+    const result = extractWireguardConfig(sample);
+    expect(result).toContain("network.wg0_peer1.public_key='PUBKEY='");
+    expect(result).toContain("network.@wireguard_wg_vps[0].public_key='PUBKEY2='");
+  });
+
+  it("excludes non-WireGuard sections", () => {
+    const result = extractWireguardConfig(sample);
+    expect(result).not.toContain("network.lan");
+  });
+
+  it("redacts private and preshared keys", () => {
+    const result = extractWireguardConfig(sample);
+    expect(result).not.toContain("SUPERSECRET");
+    expect(result).not.toContain("SECRET2");
+    expect(result).not.toContain("'PSK='");
+    expect(result).toContain("network.wg_vps.private_key='<redacted>'");
+    expect(result).toContain("network.wg0_peer1.preshared_key='<redacted>'");
+  });
+
+  it("does not redact public keys", () => {
+    const result = extractWireguardConfig(sample);
+    expect(result).toContain("PUBKEY=");
+  });
+
+  it("returns empty string when no WireGuard config exists", () => {
+    expect(extractWireguardConfig("network.lan=interface\nnetwork.lan.proto='static'")).toBe("");
   });
 });

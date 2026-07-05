@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateMode, uniqueHeredocDelimiter } from "../utils.js";
+import { shellQuote, validateMode } from "../utils.js";
 
 export const fileTools: Tool[] = [
   {
@@ -84,8 +84,9 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, content } = args;
 
-      const delimiter = uniqueHeredocDelimiter(content);
-      await client.executeCommand(`cat >> ${shellQuote(path)} << '${delimiter}'\n${content}\n${delimiter}`);
+      // Content is streamed to stdin so it is appended byte-for-byte
+      // (a heredoc would force an extra trailing newline)
+      await client.executeCommand(`cat >> ${shellQuote(path)}`, { stdin: content });
 
       return {
         success: true,

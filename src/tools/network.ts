@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { validateName } from "../utils.js";
+import { validateUciSectionName } from "../utils.js";
 
 export const networkTools: Tool[] = [
   {
@@ -32,7 +32,7 @@ export const networkTools: Tool[] = [
       required: ["interface"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
-      validateName(args.interface, "interface name");
+      validateUciSectionName(args.interface, "interface name");
       const result = await client.ubusCall("network.interface." + args.interface, "status");
       return {
         success: true,
@@ -69,7 +69,7 @@ export const networkTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { interface: iface, ipaddr, netmask, gateway } = args;
 
-      validateName(iface, "interface name");
+      validateUciSectionName(iface, "interface name");
 
       try {
         // Set protocol to static
@@ -119,7 +119,7 @@ export const networkTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { interface: iface } = args;
 
-      validateName(iface, "interface name");
+      validateUciSectionName(iface, "interface name");
 
       // Set protocol to DHCP
       await client.uciSet("network", iface, "proto", "dhcp");
@@ -179,7 +179,7 @@ export const networkTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, target, gateway, interface: iface } = args;
 
-      validateName(name, "route name");
+      validateUciSectionName(name, "route name");
 
       try {
         // Create new route section

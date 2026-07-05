@@ -1,6 +1,32 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateName, validateInt, uniqueHeredocDelimiter } from "../utils.js";
+import { shellQuote, shellEscape, validateName, validateInt } from "../utils.js";
+
+/**
+ * Read the current crontab, returning "" when none exists.
+ * Matches both GNU/vixie ("no crontab for root") and busybox
+ * ("crontab: can't open 'root': No such file or directory") messages.
+ */
+async function readCrontab(client: OpenWRTClient): Promise<string> {
+  try {
+    return await client.executeCommand("crontab -l");
+  } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    if (errorMsg.includes("no crontab") || errorMsg.includes("can't open")) {
+      return "";
+    }
+    throw error;
+  }
+}
+
+/**
+ * Replace the crontab via stdin (`crontab -`) and restart cron.
+ */
+async function writeCrontab(client: OpenWRTClient, content: string): Promise<void> {
+  const normalized = content.length === 0 || content.endsWith("\n") ? content : content + "\n";
+  await client.executeCommand("crontab -", { stdin: normalized });
+  await client.executeCommand("/etc/init.d/cron restart");
+}
 
 export const serviceTools: Tool[] = [
   {
@@ -77,7 +103,7 @@ export const serviceTools: Tool[] = [
         },
         stop_command: {
           type: "string",
-          description: "Command to run on stop (optional, will use killall by default)",
+          description: "Extra cleanup to run on stop (optional; procd stops the supervised process itself)",
         },
         start_priority: {
           type: "number",
@@ -109,31 +135,33 @@ export const serviceTools: Tool[] = [
       const safeStartPriority = validateInt(start_priority, "start_priority", 0, 99);
       const safeStopPriority = validateInt(stop_priority, "stop_priority", 0, 99);
 
-      const stopCmd = stop_command || `killall ${name}`;
       const desc = description || `${name} service`;
 
+      // Optional extra cleanup — procd itself stops the supervised process
+      const stopBlock = stop_command
+        ? `
+stop_service() {
+    ${stop_command}
+}
+`
+        : "";
+
+      // procd-supervised service (standard on modern OpenWrt): the command is
+      // tracked and respawned, and \`stop\` works even if it doesn't daemonize
       const scriptContent = `#!/bin/sh /etc/rc.common
 # ${desc}
 
+USE_PROCD=1
 START=${safeStartPriority}
 STOP=${safeStopPriority}
 
-start() {
-    echo "Starting ${name}"
-    ${start_command}
+start_service() {
+    procd_open_instance
+    procd_set_param command /bin/sh -c '${shellEscape(start_command)}'
+    procd_set_param respawn
+    procd_close_instance
 }
-
-stop() {
-    echo "Stopping ${name}"
-    ${stopCmd}
-}
-
-restart() {
-    stop
-    sleep 2
-    start
-}
-`;
+${stopBlock}`;
 
       const servicePath = `/etc/init.d/${name}`;
 
@@ -240,23 +268,12 @@ restart() {
       properties: {},
     },
     handler: async (client: OpenWRTClient) => {
-      try {
-        const output = await client.executeCommand("crontab -l");
-        return {
-          success: true,
-          crontab: output,
-        };
-      } catch (error) {
-        const errorMsg = error instanceof Error ? error.message : String(error);
-        if (errorMsg.includes("no crontab")) {
-          return {
-            success: true,
-            crontab: "",
-            message: "No crontab entries found",
-          };
-        }
-        throw error;
-      }
+      const output = await readCrontab(client);
+      return {
+        success: true,
+        crontab: output,
+        ...(output === "" ? { message: "No crontab entries found" } : {}),
+      };
     },
   },
   {
@@ -283,25 +300,14 @@ restart() {
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { schedule, command, comment } = args;
 
-      // Get current crontab
-      let currentCron = "";
-      try {
-        currentCron = await client.executeCommand("crontab -l");
-      } catch (error) {
-        // No crontab yet, that's fine
-      }
+      const currentCron = await readCrontab(client);
 
       // Add new entry
       const commentLine = comment ? `# ${comment}\n` : "";
       const newEntry = `${commentLine}${schedule} ${command}`;
-      const newCron = currentCron ? `${currentCron}\n${newEntry}` : newEntry;
+      const newCron = currentCron.trimEnd() ? `${currentCron.trimEnd()}\n${newEntry}` : newEntry;
 
-      // Write new crontab using heredoc to prevent shell expansion
-      const delimiter = uniqueHeredocDelimiter(newCron);
-      await client.executeCommand(`cat << '${delimiter}' | crontab -\n${newCron}\n${delimiter}`);
-
-      // Restart cron service
-      await client.executeCommand("/etc/init.d/cron restart");
+      await writeCrontab(client, newCron);
 
       return {
         success: true,
@@ -337,22 +343,30 @@ restart() {
         };
       }
 
-      // Get current crontab
-      const currentCron = await client.executeCommand("crontab -l");
+      if (!pattern) {
+        throw new Error("Pattern must be a non-empty string (an empty pattern would wipe the entire crontab)");
+      }
 
-      // Filter out matching lines
+      const currentCron = await readCrontab(client);
+
+      // Filter out matching lines, dropping the comment line cron_add put
+      // directly above a removed entry (avoids orphaned comments)
       const lines = currentCron.split("\n");
-      const filteredLines = lines.filter((line) => !line.includes(pattern));
-      const newCron = filteredLines.join("\n");
+      const filteredLines: string[] = [];
+      let removedCount = 0;
+      for (const line of lines) {
+        if (line.includes(pattern)) {
+          removedCount++;
+          const prev = filteredLines[filteredLines.length - 1];
+          if (prev !== undefined && prev.trim().startsWith("#")) {
+            filteredLines.pop();
+          }
+          continue;
+        }
+        filteredLines.push(line);
+      }
 
-      // Write new crontab using heredoc to prevent shell expansion
-      const delimiter = uniqueHeredocDelimiter(newCron);
-      await client.executeCommand(`cat << '${delimiter}' | crontab -\n${newCron}\n${delimiter}`);
-
-      // Restart cron service
-      await client.executeCommand("/etc/init.d/cron restart");
-
-      const removedCount = lines.length - filteredLines.length;
+      await writeCrontab(client, filteredLines.join("\n"));
 
       return {
         success: true,
