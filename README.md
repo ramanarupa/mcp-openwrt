@@ -78,7 +78,7 @@ MCP (Model Context Protocol) server for configuring and managing OpenWRT routers
 
 ## Prerequisites
 
-- Node.js 18+ and npm
+- Node.js 22.12+ or 24+ and npm (see `engines` in `package.json`)
 - OpenWRT 25.x or later (uses `apk` package manager; older versions with `opkg` are **not** supported)
 - SSH credentials (password or private key)
 
@@ -105,6 +105,14 @@ The server is configured via environment variables:
 - `OPENWRT_PASSWORD` - SSH password (required if no key)
 - `OPENWRT_PRIVATE_KEY_FILE` - Path to SSH private key file (required if no password)
 - `OPENWRT_PRIVATE_KEY` - SSH private key content directly (alternative to file path)
+- `OPENWRT_READY_TIMEOUT` - SSH handshake timeout in milliseconds (default: 30000; raise for slow or laggy uplinks)
+
+`OPENWRT_PASSWORD` may be an empty string (a router with no root password yet): the variable only has to be *set*.
+
+Per-command timeouts are separate from the handshake timeout: every tool call defaults to 30 s, package
+operations get 120 s, service start/stop/restart/reload get 90 s, and `openwrt_system_execute_command` /
+`openwrt_script_execute` accept an explicit `timeout_ms`. When a timeout fires the SSH channel is closed but
+the remote process keeps running.
 
 ### Example: Using Password Authentication
 
@@ -258,18 +266,18 @@ Set upstream DNS servers for the OpenWRT device.
 
 #### `openwrt_dns_add_static_host`
 Add a static DNS host entry (A record).
-- `name` (required): Entry identifier
+- `name` (optional): UCI section name (letters, digits, underscores). Omit to create an anonymous section; the generated id is returned as `section`
 - `hostname` (required): Hostname to resolve
 - `ip` (required): IP address
 
 #### `openwrt_dns_add_cname`
 Add a DNS CNAME record.
-- `name` (required): Entry identifier
+- `name` (optional): UCI section name; omit for an anonymous section (returned as `section`)
 - `cname` (required): CNAME alias
 - `target` (required): Target hostname
 
 #### `openwrt_dns_set_dhcp_range`
-Configure DHCP range for a network interface.
+Configure DHCP range for a network interface. The `dhcp.<interface>` section is created if it does not exist yet.
 - `interface` (required): Interface name
 - `start` (required): Start of DHCP range
 - `limit` (required): Number of addresses
@@ -277,7 +285,7 @@ Configure DHCP range for a network interface.
 
 #### `openwrt_dns_add_static_lease`
 Add a static DHCP lease (MAC to IP binding).
-- `name` (required): Entry identifier
+- `name` (optional): UCI section name (no hyphens or dots). Omit for an anonymous section, which is the right choice when the hostname contains a hyphen; the generated id is returned as `section`
 - `mac` (required): MAC address
 - `ip` (required): IP address to assign
 - `hostname` (optional): Hostname
@@ -286,6 +294,10 @@ Add a static DHCP lease (MAC to IP binding).
 
 #### `openwrt_wireguard_show_interfaces`
 List all WireGuard interfaces and their configurations.
+
+> WireGuard private and preshared keys never appear on a command line (they would be visible in `ps` on the
+> router): they are stored through `uci batch` on stdin and public keys are derived by piping into `wg pubkey`.
+> All keys are validated as 44-character base64 before use.
 
 #### `openwrt_wireguard_create_interface`
 Create a new WireGuard interface.
@@ -324,8 +336,11 @@ Get system information (uptime, load, memory, etc.).
 Get board/hardware information.
 
 #### `openwrt_system_execute_command`
-Execute a shell command on the OpenWRT device (use with caution).
+Execute a shell command on the OpenWRT device (use with caution). Returns `exit_code`, `output` (stdout) and
+`stderr`; a non-zero exit code sets `success: false` but is **not** an error, so partial output is never lost.
 - `command` (required): Shell command to execute
+- `confirm` (required): Must be `true`
+- `timeout_ms` (optional): Timeout in milliseconds (default 30000, min 1000, max 600000)
 
 #### `openwrt_system_list_processes`
 List running processes.
@@ -349,7 +364,8 @@ Remove a package using apk.
 List all available services.
 
 #### `openwrt_service_control`
-Control a service (start, stop, restart, enable, disable).
+Control a service (start, stop, restart, reload, enable, disable, status). Start/stop/restart/reload run with a
+90 s timeout; `status` is reported even when the service is stopped (non-zero exit is masked).
 - `service` (required): Service name
 - `action` (required): Action to perform (start/stop/restart/reload/enable/disable/status)
 
@@ -363,17 +379,22 @@ Create a backup of the current configuration.
 ### File Management Tools
 
 #### `openwrt_file_read`
-Read any file from the OpenWRT filesystem.
+Read any file from the OpenWRT filesystem. Output is capped so a large log cannot flood the context; the response
+carries the real `size` and a `truncated` flag. Files containing NUL bytes are reported as `binary` without content.
 - `path` (required): Full path to the file
+- `max_bytes` (optional): Cap on returned bytes (default 262144, max 16777216)
+- `tail_lines` (optional): Return only the last N lines (`tail -n N`); ignores `max_bytes`
 
 #### `openwrt_file_write`
-Write content to a file on the OpenWRT filesystem.
+Write content to a file byte-for-byte (nothing is appended, so include the trailing newline yourself). The file
+size on disk is read back and compared with the payload; a mismatch is an error. Returns `bytes_written` and
+`ends_with_newline`.
 - `path` (required): Full path to the file
 - `content` (required): Content to write
 - `mode` (optional): File permissions (e.g., '755', '644')
 
 #### `openwrt_file_append`
-Append content to an existing file.
+Append content to an existing file byte-for-byte; the size change is verified. Returns `bytes_appended` and the new `size`.
 - `path` (required): Full path to the file
 - `content` (required): Content to append
 
@@ -399,9 +420,13 @@ Search for text content in files.
 - `file_pattern` (optional): File name pattern (e.g., '*.conf')
 
 #### `openwrt_file_backup`
-Create a backup of a file or directory.
-- `path` (required): Path to backup
-- `backup_path` (optional): Backup destination
+Create a backup copy of a file or directory. By default the copy goes to
+`/root/backups/<original path>.backup-<timestamp>` (parent directories are created), never next to the original:
+directories such as `/etc/dnsmasq.d`, `/etc/config`, `/etc/init.d`, `/etc/hotplug.d` or `/etc/crontabs` load
+*every* file they contain, so an in-place `.bak` would take effect as configuration. An explicit `backup_path`
+inside one of those directories is rejected. `/root/backups` survives a reboot but not a sysupgrade.
+- `path` (required): Absolute path to back up
+- `backup_path` (optional): Absolute backup destination
 
 ### Service Management Tools
 
@@ -460,7 +485,8 @@ Create a shell script in /root/ or any specified location.
 Execute a script and return its output.
 - `path` (required): Full path to the script
 - `args` (optional): Arguments to pass to the script
-- `background` (optional): Run in background
+- `background` (optional): Run in background (detached with `nohup`, output discarded)
+- `timeout_ms` (optional): Timeout for foreground runs in milliseconds (default 30000, max 600000)
 
 #### `openwrt_script_template_backup`
 Create a backup script from a template.
@@ -609,8 +635,11 @@ mcp/
 ├── src/
 │   ├── index.ts              # Main MCP server with handlers
 │   ├── openwrt-client.ts     # OpenWRT SSH/ubus/UCI client
+│   ├── utils.ts              # Shell quoting and input validators
+│   ├── types.ts              # Tool interface
 │   ├── resources.ts          # MCP Resources (config files, logs)
 │   ├── prompts.ts            # Smart prompts for common tasks
+│   ├── __tests__/            # vitest unit tests (mocked SSH)
 │   └── tools/
 │       ├── network.ts        # Network management (6 tools)
 │       ├── dns.ts            # DNS/DHCP management (6 tools)
@@ -622,6 +651,7 @@ mcp/
 ├── build/                    # Compiled JavaScript output
 ├── package.json
 ├── tsconfig.json
+├── vitest.config.ts
 ├── .gitignore
 ├── .env.example
 └── README.md
@@ -632,6 +662,11 @@ mcp/
 ### Building
 ```bash
 npm run build
+```
+
+### Tests
+```bash
+npm test
 ```
 
 ### Watch Mode (for development)
@@ -659,7 +694,10 @@ npm run watch
 - Check OpenWRT user permissions
 
 ### Tool Errors
-- Check OpenWRT logs: `/var/log/messages`
+- A failed command's error message contains both stderr and (truncated) stdout
+- `openwrt_system_execute_command` never throws on a non-zero exit code; inspect `exit_code` and `stderr`
+- "Command timed out" means the SSH channel was closed; the process on the router may still be running
+- Check OpenWRT logs: `logread`
 - Verify ubus is running: `ubus list`
 - Check UCI configuration: `uci show`
 

@@ -121,11 +121,16 @@ export const networkTools: Tool[] = [
 
       validateUciSectionName(iface, "interface name");
 
-      // Set protocol to DHCP
-      await client.uciSet("network", iface, "proto", "dhcp");
+      try {
+        // Set protocol to DHCP
+        await client.uciSet("network", iface, "proto", "dhcp");
 
-      // Commit changes
-      await client.uciCommit("network");
+        // Commit changes
+        await client.uciCommit("network");
+      } catch (error) {
+        await client.uciRevert("network");
+        throw error;
+      }
 
       // Reload network
       await client.reloadNetwork();

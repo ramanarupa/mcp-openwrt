@@ -114,3 +114,68 @@ export function extractWireguardConfig(uciOutput: string): string {
     )
     .join("\n");
 }
+
+/**
+ * Validate a UCI section reference as used in `uci set/get` paths: either a
+ * named section (letters, digits, underscores) or an anonymous reference
+ * such as `@dnsmasq[0]` / `@rule[-1]`.
+ */
+export function validateUciSectionRef(value: string, label: string): void {
+  if (!value || !/^(?:[A-Za-z0-9_]+|@[A-Za-z0-9_]+\[-?\d+\])$/.test(value)) {
+    throw new Error(
+      `Invalid ${label}: ${JSON.stringify(value)}. Expected a UCI section name (letters, digits, underscores) or an anonymous reference like "@dnsmasq[0]".`
+    );
+  }
+}
+
+/**
+ * Validate a WireGuard key (private, public or preshared): 32 bytes of
+ * base64, i.e. 43 base64 characters followed by "=".
+ */
+export function validateWgKey(value: unknown, label: string): string {
+  if (typeof value !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(value)) {
+    throw new Error(`Invalid ${label}: expected a 44-character base64 WireGuard key.`);
+  }
+  return value;
+}
+
+/**
+ * Directories whose *every* file is read as configuration by some daemon or
+ * boot hook. A backup copy dropped inside one of them is silently loaded as
+ * config (dnsmasq picks up `/etc/dnsmasq.d/*.bak`, procd runs `/etc/init.d/*`,
+ * uci treats every file in `/etc/config/` as a package, …).
+ */
+export const WHOLESALE_READ_DIRS = [
+  "/etc/config",
+  "/etc/dnsmasq.d",
+  "/etc/init.d",
+  "/etc/rc.d",
+  "/etc/rc.button",
+  "/etc/hotplug.d",
+  "/etc/crontabs",
+  "/etc/uci-defaults",
+  "/etc/sysctl.d",
+  "/etc/modules.d",
+  "/etc/modules-boot.d",
+  "/etc/nftables.d",
+  "/etc/firewall.d",
+  "/etc/profile.d",
+  "/etc/ppp/ip-up.d",
+  "/etc/ppp/ip-down.d",
+  "/etc/udhcpc.user.d",
+  "/etc/wireguard",
+];
+
+/**
+ * Throw when `destination` lives inside a directory that is read wholesale
+ * (see WHOLESALE_READ_DIRS). Used to keep backups from being loaded as config.
+ */
+export function assertSafeBackupDestination(destination: string): void {
+  for (const dir of WHOLESALE_READ_DIRS) {
+    if (destination === dir || destination.startsWith(dir + "/")) {
+      throw new Error(
+        `Refusing to write a backup inside ${dir}: every file in that directory is loaded as configuration, so the copy would take effect too. Use a destination under /root/backups or /tmp.`
+      );
+    }
+  }
+}

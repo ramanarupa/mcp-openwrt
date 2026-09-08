@@ -2,6 +2,23 @@ import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
 import { shellQuote, validateUciSectionName } from "../utils.js";
 
+/**
+ * Create a section in `config`: named when `name` is given (validated as a
+ * UCI identifier), otherwise anonymous via `uci add`, which sidesteps the
+ * "hostname with a hyphen is not a valid section name" trap. Returns the
+ * section id to use for subsequent `uci set` calls.
+ */
+async function createDhcpSection(client: OpenWRTClient, type: string, name?: string): Promise<string> {
+  if (name) {
+    await client.uciAddSection("dhcp", name, type);
+    return name;
+  }
+  return client.uciAddAnonymousSection("dhcp", type);
+}
+
+const NAME_DESCRIPTION =
+  "UCI section name (optional; letters, digits, underscores only). Omit to create an anonymous section — required when the natural name contains hyphens or dots.";
+
 export const dnsTools: Tool[] = [
   {
     name: "openwrt_dns_show_config",
@@ -75,7 +92,7 @@ export const dnsTools: Tool[] = [
       properties: {
         name: {
           type: "string",
-          description: "Entry name/identifier for UCI configuration",
+          description: NAME_DESCRIPTION,
         },
         hostname: {
           type: "string",
@@ -86,18 +103,19 @@ export const dnsTools: Tool[] = [
           description: "IP address for the hostname",
         },
       },
-      required: ["name", "hostname", "ip"],
+      required: ["hostname", "ip"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, hostname, ip } = args;
 
-      validateUciSectionName(name, "entry name");
+      if (name) validateUciSectionName(name, "entry name");
 
+      let section: string;
       try {
         // Create new domain section
-        await client.uciAddSection("dhcp", name, "domain");
-        await client.uciSet("dhcp", name, "name", hostname);
-        await client.uciSet("dhcp", name, "ip", ip);
+        section = await createDhcpSection(client, "domain", name);
+        await client.uciSet("dhcp", section, "name", hostname);
+        await client.uciSet("dhcp", section, "ip", ip);
 
         // Commit and reload
         await client.uciCommit("dhcp");
@@ -111,6 +129,7 @@ export const dnsTools: Tool[] = [
       return {
         success: true,
         message: `Static DNS entry added: ${hostname} -> ${ip}`,
+        section,
         entry: { hostname, ip },
       };
     },
@@ -123,7 +142,7 @@ export const dnsTools: Tool[] = [
       properties: {
         name: {
           type: "string",
-          description: "Entry name/identifier for UCI configuration",
+          description: NAME_DESCRIPTION,
         },
         cname: {
           type: "string",
@@ -134,18 +153,19 @@ export const dnsTools: Tool[] = [
           description: "Target hostname (e.g., 'server.local')",
         },
       },
-      required: ["name", "cname", "target"],
+      required: ["cname", "target"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, cname, target } = args;
 
-      validateUciSectionName(name, "entry name");
+      if (name) validateUciSectionName(name, "entry name");
 
+      let section: string;
       try {
         // Create new cname section
-        await client.uciAddSection("dhcp", name, "cname");
-        await client.uciSet("dhcp", name, "cname", cname);
-        await client.uciSet("dhcp", name, "target", target);
+        section = await createDhcpSection(client, "cname", name);
+        await client.uciSet("dhcp", section, "cname", cname);
+        await client.uciSet("dhcp", section, "target", target);
 
         // Commit and reload
         await client.uciCommit("dhcp");
@@ -159,6 +179,7 @@ export const dnsTools: Tool[] = [
       return {
         success: true,
         message: `CNAME record added: ${cname} -> ${target}`,
+        section,
         entry: { cname, target },
       };
     },
@@ -194,6 +215,9 @@ export const dnsTools: Tool[] = [
       validateUciSectionName(iface, "interface name");
 
       try {
+        // The dhcp.<iface> section may not exist yet (uci set on a missing
+        // section fails with "Invalid argument"); create it idempotently
+        await client.uciAddSection("dhcp", iface, "dhcp", { allowExisting: true });
         // Configure DHCP pool
         await client.uciSet("dhcp", iface, "interface", iface);
         await client.uciSet("dhcp", iface, "start", start.toString());
@@ -224,7 +248,7 @@ export const dnsTools: Tool[] = [
       properties: {
         name: {
           type: "string",
-          description: "Entry name/identifier",
+          description: NAME_DESCRIPTION,
         },
         mac: {
           type: "string",
@@ -239,21 +263,22 @@ export const dnsTools: Tool[] = [
           description: "Hostname (optional)",
         },
       },
-      required: ["name", "mac", "ip"],
+      required: ["mac", "ip"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { name, mac, ip, hostname } = args;
 
-      validateUciSectionName(name, "entry name");
+      if (name) validateUciSectionName(name, "entry name");
 
+      let section: string;
       try {
         // Create new host section
-        await client.uciAddSection("dhcp", name, "host");
-        await client.uciSet("dhcp", name, "mac", mac);
-        await client.uciSet("dhcp", name, "ip", ip);
+        section = await createDhcpSection(client, "host", name);
+        await client.uciSet("dhcp", section, "mac", mac);
+        await client.uciSet("dhcp", section, "ip", ip);
 
         if (hostname) {
-          await client.uciSet("dhcp", name, "name", hostname);
+          await client.uciSet("dhcp", section, "name", hostname);
         }
 
         // Commit and reload
@@ -268,6 +293,7 @@ export const dnsTools: Tool[] = [
       return {
         success: true,
         message: `Static DHCP lease added: ${mac} -> ${ip}`,
+        section,
         entry: { mac, ip, hostname },
       };
     },

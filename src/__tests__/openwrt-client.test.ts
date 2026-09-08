@@ -222,6 +222,215 @@ describe("OpenWRTClient", () => {
     });
   });
 
+  describe("executeCommandRaw()", () => {
+    it("resolves with the exit code instead of rejecting", async () => {
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (_cmd, cb) => {
+          const stream = new MockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            stream.emit("data", Buffer.from("partial"));
+            stream.stderr.emit("data", Buffer.from("oops"));
+            stream.emit("close", 3);
+          });
+        },
+      };
+
+      const client = makeClient();
+      await client.connect();
+      const result = await client.executeCommandRaw("false");
+      expect(result).toEqual({ code: 3, stdout: "partial", stderr: "oops" });
+    });
+
+    it("reassembles multi-byte UTF-8 characters split across chunks", async () => {
+      const bytes = Buffer.from("привет мир", "utf8"); // 19 bytes
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (_cmd, cb) => {
+          const stream = new MockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            // Split in the middle of the 2-byte "и" (bytes 2..3)
+            stream.emit("data", bytes.subarray(0, 3));
+            stream.emit("data", bytes.subarray(3));
+            stream.emit("close", 0);
+          });
+        },
+      };
+
+      const client = makeClient();
+      await client.connect();
+      expect(await client.executeCommand("cat")).toBe("привет мир");
+    });
+
+    it("executeCommand error message includes stdout of a failed command", async () => {
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (_cmd, cb) => {
+          const stream = new MockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            stream.emit("data", Buffer.from("step 1 ok\nstep 2 ok"));
+            stream.stderr.emit("data", Buffer.from("step 3 failed"));
+            stream.emit("close", 1);
+          });
+        },
+      };
+
+      const client = makeClient();
+      await client.connect();
+      await expect(client.executeCommand("script.sh")).rejects.toThrow(
+        /Command failed with code 1: step 3 failed\nstdout: step 1 ok\nstep 2 ok/
+      );
+    });
+  });
+
+  describe("UCI helpers", () => {
+    /** Route commands to canned {code, stdout} responses; records commands and stdin. */
+    function routeCommands(routes: (cmd: string) => { code: number; stdout?: string; stderr?: string } | undefined) {
+      const seen: { cmd: string; stdin?: string }[] = [];
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (cmd, cb) => {
+          const stream = new MockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            seen.push({ cmd, stdin: stream.written });
+            const r = routes(cmd) ?? { code: 0, stdout: "" };
+            if (r.stdout) stream.emit("data", Buffer.from(r.stdout));
+            if (r.stderr) stream.stderr.emit("data", Buffer.from(r.stderr));
+            stream.emit("close", r.code);
+          });
+        },
+      };
+      return seen;
+    }
+
+    it("uciSetSecret feeds the assignment to uci batch via stdin", async () => {
+      const seen = routeCommands(() => undefined);
+      const client = makeClient();
+      await client.connect();
+      await client.uciSetSecret("network", "wg0", "private_key", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+
+      expect(seen).toHaveLength(1);
+      expect(seen[0].cmd).toBe("uci batch");
+      expect(seen[0].stdin).toBe("set network.wg0.private_key=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n");
+    });
+
+    it("uciSetSecret treats stderr from uci batch as failure", async () => {
+      routeCommands(() => ({ code: 0, stderr: "uci: Invalid argument\n" }));
+      const client = makeClient();
+      await client.connect();
+      await expect(
+        client.uciSetSecret("network", "nope", "private_key", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+      ).rejects.toThrow("uci batch failed");
+    });
+
+    it("uciSetSecret rejects values that could inject batch commands", async () => {
+      const seen = routeCommands(() => undefined);
+      const client = makeClient();
+      await client.connect();
+      await expect(client.uciSetSecret("network", "wg0", "private_key", "a\nset network.lan.proto=none")).rejects.toThrow(
+        "Invalid value"
+      );
+      await expect(client.uciSetSecret("network", "wg0", "private_key", "it's")).rejects.toThrow("Invalid value");
+      expect(seen).toHaveLength(0);
+    });
+
+    it("uciAddSection refuses to re-type an existing section", async () => {
+      const seen = routeCommands((cmd) =>
+        cmd === "uci -q get network.lan" ? { code: 0, stdout: "interface\n" } : undefined
+      );
+      const client = makeClient();
+      await client.connect();
+      await expect(client.uciAddSection("network", "lan", "route")).rejects.toThrow("already exists (type 'interface')");
+      expect(seen.some((s) => s.cmd.startsWith("uci set"))).toBe(false);
+    });
+
+    it("uciAddSection with allowExisting is a no-op for a same-typed section", async () => {
+      const seen = routeCommands((cmd) =>
+        cmd === "uci -q get dhcp.lan" ? { code: 0, stdout: "dhcp\n" } : undefined
+      );
+      const client = makeClient();
+      await client.connect();
+      await client.uciAddSection("dhcp", "lan", "dhcp", { allowExisting: true });
+      expect(seen.map((s) => s.cmd)).toEqual(["uci -q get dhcp.lan"]);
+    });
+
+    it("uciAddSection creates a missing section", async () => {
+      const seen = routeCommands((cmd) => (cmd.startsWith("uci -q get") ? { code: 1 } : undefined));
+      const client = makeClient();
+      await client.connect();
+      await client.uciAddSection("network", "r1", "route");
+      expect(seen.map((s) => s.cmd)).toEqual(["uci -q get network.r1", "uci set network.r1=route"]);
+    });
+
+    it("uciAddAnonymousSection returns the generated id", async () => {
+      routeCommands((cmd) => (cmd === "uci add dhcp host" ? { code: 0, stdout: "cfg0a3b5c\n" } : undefined));
+      const client = makeClient();
+      await client.connect();
+      expect(await client.uciAddAnonymousSection("dhcp", "host")).toBe("cfg0a3b5c");
+    });
+
+    it("uciSet validates path components", async () => {
+      routeCommands(() => undefined);
+      const client = makeClient();
+      await client.connect();
+      await expect(client.uciSet("network", "lan; rm -rf /", "proto", "x")).rejects.toThrow("Invalid UCI section");
+      await expect(client.uciSet("net work", "lan", "proto", "x")).rejects.toThrow("Invalid UCI config name");
+      // anonymous references are fine
+      await client.uciSet("dhcp", "@dnsmasq[0]", "noresolv", "1");
+    });
+  });
+
+  describe("readFileLimited()", () => {
+    it("parses size line and content, flags truncation", async () => {
+      let capturedCommand = "";
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (cmd, cb) => {
+          capturedCommand = cmd;
+          const stream = new MockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            stream.emit("data", Buffer.from("1000\nfirst\nlines"));
+            stream.emit("close", 0);
+          });
+        },
+      };
+
+      const client = makeClient();
+      await client.connect();
+      const result = await client.readFileLimited("/tmp/big", 11);
+      expect(capturedCommand).toBe("wc -c < '/tmp/big' && head -c 11 '/tmp/big'");
+      expect(result).toEqual({ content: "first\nlines", size: 1000, truncated: true });
+    });
+  });
+
+  describe("appendFile()", () => {
+    it("verifies the file grew by exactly the payload", async () => {
+      const cmds: string[] = [];
+      nextBehavior = {
+        connectAction: "ready",
+        execHandler: (cmd, cb) => {
+          cmds.push(cmd);
+          const stream = new MockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            stream.emit("data", Buffer.from(cmd.startsWith("cat >>") ? "15\n" : "10\n"));
+            stream.emit("close", 0);
+          });
+        },
+      };
+
+      const client = makeClient();
+      await client.connect();
+      expect(await client.appendFile("/tmp/f", "hello")).toBe(15);
+      expect(cmds).toEqual(["wc -c < '/tmp/f'", "cat >> '/tmp/f' && wc -c < '/tmp/f'"]);
+    });
+  });
+
   describe("ubusCall()", () => {
     it("constructs correct command with shellQuote", async () => {
       let capturedCommand = "";
@@ -269,7 +478,8 @@ describe("OpenWRTClient", () => {
   });
 
   describe("writeFile()", () => {
-    function captureWrite() {
+    /** Emulates `cat > f && wc -c < f`: reports the byte length of what was written. */
+    function captureWrite(reportedSize?: number) {
       const captured = { command: "", stream: null as MockStream | null };
       nextBehavior = {
         connectAction: "ready",
@@ -279,6 +489,8 @@ describe("OpenWRTClient", () => {
           captured.stream = stream;
           cb(null, stream);
           process.nextTick(() => {
+            const size = reportedSize ?? Buffer.byteLength(stream.written ?? "", "utf8");
+            stream.emit("data", Buffer.from(`${size}\n`));
             stream.emit("close", 0);
           });
         },
@@ -286,15 +498,32 @@ describe("OpenWRTClient", () => {
       return captured;
     }
 
-    it("streams content to stdin of cat with quoted path", async () => {
+    it("streams content to stdin of cat with quoted path and verifies the size", async () => {
       const captured = captureWrite();
 
       const client = makeClient();
       await client.connect();
-      await client.writeFile("/tmp/test", "hello world");
+      const bytes = await client.writeFile("/tmp/test", "hello world");
 
-      expect(captured.command).toBe("cat > '/tmp/test'");
+      expect(captured.command).toBe("cat > '/tmp/test' && wc -c < '/tmp/test'");
       expect(captured.stream!.written).toBe("hello world");
+      expect(bytes).toBe(11);
+    });
+
+    it("counts UTF-8 bytes, not characters, when verifying", async () => {
+      captureWrite();
+      const client = makeClient();
+      await client.connect();
+      expect(await client.writeFile("/tmp/test", "привет")).toBe(12);
+    });
+
+    it("throws when the on-disk size differs from the payload", async () => {
+      captureWrite(10); // one byte short — e.g. a dropped trailing newline
+      const client = makeClient();
+      await client.connect();
+      await expect(client.writeFile("/tmp/test", "hello world")).rejects.toThrow(
+        "expected 11 bytes on disk, found 10"
+      );
     });
 
     it("writes content byte-for-byte without adding a trailing newline", async () => {

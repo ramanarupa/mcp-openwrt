@@ -21,6 +21,25 @@ function createMockClient() {
       calls.push({ method: "executeCommand", args: [cmd, options] });
       return "";
     }),
+    executeCommandRaw: vi.fn(async (cmd: string, options?: { timeout?: number; stdin?: string }) => {
+      calls.push({ method: "executeCommandRaw", args: [cmd, options] });
+      return { code: 0, stdout: "", stderr: "" };
+    }),
+    uciSetSecret: vi.fn(async (config: string, section: string, option: string, value: string) => {
+      calls.push({ method: "uciSetSecret", args: [config, section, option, value] });
+    }),
+    uciAddAnonymousSection: vi.fn(async (config: string, type: string) => {
+      calls.push({ method: "uciAddAnonymousSection", args: [config, type] });
+      return "cfg0a3b5c";
+    }),
+    readFileLimited: vi.fn(async (path: string, maxBytes: number) => {
+      calls.push({ method: "readFileLimited", args: [path, maxBytes] });
+      return { content: "file content", size: 12, truncated: false };
+    }),
+    appendFile: vi.fn(async (path: string, content: string) => {
+      calls.push({ method: "appendFile", args: [path, content] });
+      return content.length;
+    }),
     ubusCall: vi.fn(async (path: string, method: string, params?: any) => {
       calls.push({ method: "ubusCall", args: [path, method, params] });
       return { interface: [] };
@@ -28,8 +47,8 @@ function createMockClient() {
     uciSet: vi.fn(async (config: string, section: string, option: string, value: string) => {
       calls.push({ method: "uciSet", args: [config, section, option, value] });
     }),
-    uciAddSection: vi.fn(async (config: string, section: string, type: string) => {
-      calls.push({ method: "uciAddSection", args: [config, section, type] });
+    uciAddSection: vi.fn(async (config: string, section: string, type: string, options?: { allowExisting?: boolean }) => {
+      calls.push({ method: "uciAddSection", args: [config, section, type, options] });
     }),
     uciCommit: vi.fn(async (config?: string) => {
       calls.push({ method: "uciCommit", args: [config] });
@@ -47,6 +66,7 @@ function createMockClient() {
     }),
     writeFile: vi.fn(async (path: string, content: string) => {
       calls.push({ method: "writeFile", args: [path, content] });
+      return Buffer.byteLength(content, "utf8");
     }),
     reloadNetwork: vi.fn(async () => {
       calls.push({ method: "reloadNetwork", args: [] });
@@ -134,23 +154,100 @@ describe("File tools", () => {
 
   it("file_read lets errors propagate (no try-catch)", async () => {
     const tool = findTool(fileTools, "openwrt_file_read");
-    (client as any).readFile = vi.fn(async () => {
+    (client as any).readFileLimited = vi.fn(async () => {
       throw new Error("File not found");
     });
 
     await expect(tool.handler(client, { path: "/nonexistent" })).rejects.toThrow("File not found");
   });
 
-  it("file_append streams content via stdin byte-for-byte", async () => {
-    const tool = findTool(fileTools, "openwrt_file_append");
-    await tool.handler(client, { path: "/tmp/test", content: "extra line" });
+  it("file_read caps output at 256 KiB by default and reports truncation", async () => {
+    const tool = findTool(fileTools, "openwrt_file_read");
+    (client as any).readFileLimited = vi.fn(async (_path: string, maxBytes: number) => ({
+      content: "x".repeat(maxBytes),
+      size: 1_000_000,
+      truncated: true,
+    }));
 
-    const appendCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0].startsWith("cat >>")
-    );
+    const result = await tool.handler(client, { path: "/tmp/big.log" });
+    expect((client as any).readFileLimited).toHaveBeenCalledWith("/tmp/big.log", 262144);
+    expect(result.truncated).toBe(true);
+    expect(result.size).toBe(1_000_000);
+    expect(result.message).toContain("max_bytes");
+  });
+
+  it("file_read tail_lines uses tail -n with a quoted path", async () => {
+    const tool = findTool(fileTools, "openwrt_file_read");
+    await tool.handler(client, { path: "/tmp/a b.log", tail_lines: 50 });
+
+    const tailCall = client.calls.find((c) => c.method === "executeCommand");
+    expect(tailCall!.args[0]).toBe("tail -n 50 '/tmp/a b.log'");
+    expect(client.calls.some((c) => c.method === "readFileLimited")).toBe(false);
+  });
+
+  it("file_read omits content of binary files", async () => {
+    const tool = findTool(fileTools, "openwrt_file_read");
+    (client as any).readFileLimited = vi.fn(async () => ({
+      content: "PK\u0000\u0003",
+      size: 4,
+      truncated: false,
+    }));
+
+    const result = await tool.handler(client, { path: "/tmp/x.zip" });
+    expect(result.binary).toBe(true);
+    expect(result.content).toBeUndefined();
+  });
+
+  it("file_write reports bytes_written and trailing-newline state", async () => {
+    const tool = findTool(fileTools, "openwrt_file_write");
+    const result = await tool.handler(client, { path: "/tmp/test", content: "привет\n" });
+    expect(result.bytes_written).toBe(Buffer.byteLength("привет\n", "utf8"));
+    expect(result.ends_with_newline).toBe(true);
+  });
+
+  it("file_write validates mode before touching the file", async () => {
+    const tool = findTool(fileTools, "openwrt_file_write");
+    await expect(
+      tool.handler(client, { path: "/tmp/test", content: "hello", mode: "abc" })
+    ).rejects.toThrow("Invalid file mode");
+    expect(client.calls.some((c) => c.method === "writeFile")).toBe(false);
+  });
+
+  it("file_append delegates to appendFile and reports sizes", async () => {
+    const tool = findTool(fileTools, "openwrt_file_append");
+    const result = await tool.handler(client, { path: "/tmp/test", content: "extra line" });
+
+    const appendCall = client.calls.find((c) => c.method === "appendFile");
     expect(appendCall).toBeDefined();
-    expect(appendCall!.args[0]).toBe("cat >> '/tmp/test'");
-    expect(appendCall!.args[1]).toEqual({ stdin: "extra line" });
+    expect(appendCall!.args).toEqual(["/tmp/test", "extra line"]);
+    expect(result.bytes_appended).toBe(10);
+  });
+
+  it("file_backup defaults to /root/backups mirroring the original path", async () => {
+    const tool = findTool(fileTools, "openwrt_file_backup");
+    const result = await tool.handler(client, { path: "/etc/dnsmasq.d/routes.conf" });
+
+    expect(result.backup_path).toMatch(/^\/root\/backups\/etc\/dnsmasq\.d\/routes\.conf\.backup-/);
+    const mkdirCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].startsWith("mkdir -p")
+    );
+    expect(mkdirCall!.args[0]).toBe("mkdir -p '/root/backups/etc/dnsmasq.d'");
+  });
+
+  it("file_backup refuses a destination inside a wholesale-read directory", async () => {
+    const tool = findTool(fileTools, "openwrt_file_backup");
+    await expect(
+      tool.handler(client, { path: "/etc/dnsmasq.d/routes.conf", backup_path: "/etc/dnsmasq.d/routes.conf.bak" })
+    ).rejects.toThrow("Refusing to write a backup inside /etc/dnsmasq.d");
+    await expect(
+      tool.handler(client, { path: "/etc/config/network", backup_path: "/etc/config/network.bak" })
+    ).rejects.toThrow("/etc/config");
+    expect(client.calls.filter((c) => c.method === "executeCommand")).toHaveLength(0);
+  });
+
+  it("file_backup rejects relative paths", async () => {
+    const tool = findTool(fileTools, "openwrt_file_backup");
+    await expect(tool.handler(client, { path: "etc/config/network" })).rejects.toThrow("Invalid path");
   });
 });
 
@@ -222,10 +319,56 @@ describe("System tools", () => {
     const tool = findTool(systemTools, "openwrt_system_execute_command");
     const result = await tool.handler(client, { command: "uptime", confirm: true });
     expect(result.success).toBe(true);
+    expect(result.exit_code).toBe(0);
     const execCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0] === "uptime"
+      (c) => c.method === "executeCommandRaw" && c.args[0] === "uptime"
     );
     expect(execCall).toBeDefined();
+    expect(execCall!.args[1]).toEqual({ timeout: undefined });
+  });
+
+  it("execute_command reports a non-zero exit code with stdout and stderr instead of throwing", async () => {
+    (client as any).executeCommandRaw = vi.fn(async () => ({
+      code: 2,
+      stdout: "partial output",
+      stderr: "boom",
+    }));
+
+    const tool = findTool(systemTools, "openwrt_system_execute_command");
+    const result = await tool.handler(client, { command: "false", confirm: true });
+    expect(result.success).toBe(false);
+    expect(result.exit_code).toBe(2);
+    expect(result.output).toBe("partial output");
+    expect(result.stderr).toBe("boom");
+  });
+
+  it("execute_command passes timeout_ms through and bounds it", async () => {
+    const tool = findTool(systemTools, "openwrt_system_execute_command");
+    await tool.handler(client, { command: "sleep 60", confirm: true, timeout_ms: 120_000 });
+    const execCall = client.calls.find((c) => c.method === "executeCommandRaw");
+    expect(execCall!.args[1]).toEqual({ timeout: 120_000 });
+
+    await expect(
+      tool.handler(client, { command: "sleep 60", confirm: true, timeout_ms: 5 })
+    ).rejects.toThrow("Invalid timeout_ms");
+    await expect(
+      tool.handler(client, { command: "sleep 60", confirm: true, timeout_ms: 10_000_000 })
+    ).rejects.toThrow("Invalid timeout_ms");
+  });
+
+  it("service_control restart uses an extended timeout, enable does not", async () => {
+    const tool = findTool(systemTools, "openwrt_service_control");
+    await tool.handler(client, { service: "network", action: "restart" });
+    await tool.handler(client, { service: "network", action: "enable" });
+
+    const restartCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0] === "/etc/init.d/network restart"
+    );
+    const enableCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0] === "/etc/init.d/network enable"
+    );
+    expect(restartCall!.args[1]?.timeout).toBeGreaterThan(30_000);
+    expect(enableCall!.args[1]?.timeout).toBeUndefined();
   });
 
   it("package_list_installed filter uses -F and shellQuote", async () => {
@@ -442,10 +585,10 @@ describe("WireGuard tools", () => {
   beforeEach(() => {
     client = createMockClient();
     // Mock wg genkey and wg pubkey responses
-    (client as any).executeCommand = vi.fn(async (cmd: string) => {
-      client.calls.push({ method: "executeCommand", args: [cmd] });
-      if (cmd === "wg genkey") return "privatekey123\n";
-      if (cmd.includes("wg pubkey")) return "publickey456\n";
+    (client as any).executeCommand = vi.fn(async (cmd: string, options?: any) => {
+      client.calls.push({ method: "executeCommand", args: [cmd, options] });
+      if (cmd === "wg genkey") return "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n";
+      if (cmd.includes("wg pubkey")) return "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=\n";
       return "";
     });
   });
@@ -457,17 +600,64 @@ describe("WireGuard tools", () => {
     ).rejects.toThrow("Invalid interface name");
   });
 
-  it("create_interface quotes private key in echo | wg pubkey", async () => {
+  it("create_interface never puts the private key on a command line", async () => {
     const tool = findTool(wireguardTools, "openwrt_wireguard_create_interface");
-    await tool.handler(client, { name: "wg0", listen_port: 51820, addresses: ["10.0.0.1/24"] });
+    const result = await tool.handler(client, { name: "wg0", listen_port: 51820, addresses: ["10.0.0.1/24"] });
 
+    // Public key derived via stdin
     const pubkeyCall = client.calls.find(
-      (c) => c.method === "executeCommand" && c.args[0].includes("wg pubkey")
+      (c) => c.method === "executeCommand" && c.args[0] === "wg pubkey"
     );
     expect(pubkeyCall).toBeDefined();
-    // Should use shellQuote, not double quotes
-    expect(pubkeyCall!.args[0]).toContain("echo '");
-    expect(pubkeyCall!.args[0]).not.toContain('"');
+    expect(pubkeyCall!.args[1]).toEqual({ stdin: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n" });
+    expect(result.public_key).toBe("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=");
+
+    // Private key stored via uciSetSecret, not uciSet
+    const secretCall = client.calls.find((c) => c.method === "uciSetSecret");
+    expect(secretCall!.args).toEqual(["network", "wg0", "private_key", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]);
+    expect(client.calls.some((c) => c.method === "uciSet" && c.args[2] === "private_key")).toBe(false);
+
+    // No executed command contains the key
+    for (const c of client.calls.filter((c) => c.method === "executeCommand")) {
+      expect(c.args[0]).not.toContain("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    }
+  });
+
+  it("create_interface rejects a malformed user-supplied private key", async () => {
+    const tool = findTool(wireguardTools, "openwrt_wireguard_create_interface");
+    await expect(
+      tool.handler(client, { name: "wg0", private_key: "not-a-key", listen_port: 51820, addresses: ["10.0.0.1/24"] })
+    ).rejects.toThrow("Invalid private_key");
+    expect(client.calls.some((c) => c.method === "uciAddSection")).toBe(false);
+  });
+
+  it("add_peer validates public_key and stores preshared_key as a secret", async () => {
+    const tool = findTool(wireguardTools, "openwrt_wireguard_add_peer");
+    await expect(
+      tool.handler(client, { interface: "wg0", peer_name: "c1", public_key: "short", allowed_ips: ["10.0.0.2/32"] })
+    ).rejects.toThrow("Invalid public_key");
+
+    await tool.handler(client, {
+      interface: "wg0",
+      peer_name: "c1",
+      public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
+      allowed_ips: ["10.0.0.2/32"],
+      preshared_key: "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=",
+    });
+    const secretCall = client.calls.find((c) => c.method === "uciSetSecret");
+    expect(secretCall!.args).toEqual(["network", "wg0_c1", "preshared_key", "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC="]);
+    expect(client.calls.some((c) => c.method === "uciSet" && c.args[2] === "preshared_key")).toBe(false);
+  });
+
+  it("generate_keypair derives the public key via stdin", async () => {
+    const tool = findTool(wireguardTools, "openwrt_wireguard_generate_keypair");
+    const result = await tool.handler(client, {});
+    expect(result.private_key).toBe("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=");
+    expect(result.public_key).toBe("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=");
+    const pubkeyCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0] === "wg pubkey"
+    );
+    expect(pubkeyCall!.args[1]).toEqual({ stdin: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\n" });
   });
 
   it("create_interface quotes addresses in uci add_list", async () => {
@@ -487,7 +677,7 @@ describe("WireGuard tools", () => {
       tool.handler(client, {
         interface: "wg0",
         peer_name: "bad peer",
-        public_key: "key",
+        public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
         allowed_ips: ["10.0.0.2/32"],
       })
     ).rejects.toThrow("Invalid peer name");
@@ -498,7 +688,7 @@ describe("WireGuard tools", () => {
     await tool.handler(client, {
       interface: "wg0",
       peer_name: "client1",
-      public_key: "key123",
+      public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
       allowed_ips: ["10.0.0.2/32"],
       endpoint: "example.com:51820",
     });
@@ -539,7 +729,7 @@ describe("WireGuard tools", () => {
       tool.handler(client, {
         interface: "wg0",
         peer_name: "my-peer",
-        public_key: "key",
+        public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
         allowed_ips: ["10.0.0.2/32"],
       })
     ).rejects.toThrow("Invalid peer name");
@@ -550,7 +740,7 @@ describe("WireGuard tools", () => {
     await tool.handler(client, {
       interface: "wg0",
       peer_name: "client1",
-      public_key: "key123",
+      public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
       allowed_ips: ["10.0.0.2/32"],
       endpoint: "[2001:db8::1]:51820",
     });
@@ -571,7 +761,7 @@ describe("WireGuard tools", () => {
       tool.handler(client, {
         interface: "wg0",
         peer_name: "client1",
-        public_key: "key123",
+        public_key: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=",
         allowed_ips: ["10.0.0.2/32"],
         endpoint: "example.com",
       })
@@ -660,6 +850,41 @@ describe("DNS tools", () => {
     ).rejects.toThrow("Invalid entry name");
   });
 
+  it("add_static_lease without name creates an anonymous host section", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_add_static_lease");
+    const result = await tool.handler(client, { mac: "aa:bb:cc:dd:ee:ff", ip: "1.2.3.4", hostname: "my-host" });
+
+    expect(result.success).toBe(true);
+    expect(result.section).toBe("cfg0a3b5c");
+    const addCall = client.calls.find((c) => c.method === "uciAddAnonymousSection");
+    expect(addCall!.args).toEqual(["dhcp", "host"]);
+    expect(client.calls.some((c) => c.method === "uciAddSection")).toBe(false);
+    const nameSet = client.calls.find((c) => c.method === "uciSet" && c.args[2] === "name");
+    expect(nameSet!.args).toEqual(["dhcp", "cfg0a3b5c", "name", "my-host"]);
+  });
+
+  it("add_static_host and add_cname accept a missing name", async () => {
+    const hostTool = findTool(dnsTools, "openwrt_dns_add_static_host");
+    const hostResult = await hostTool.handler(client, { hostname: "nas.lan", ip: "192.168.1.10" });
+    expect(hostResult.section).toBe("cfg0a3b5c");
+
+    const cnameTool = findTool(dnsTools, "openwrt_dns_add_cname");
+    const cnameResult = await cnameTool.handler(client, { cname: "www.lan", target: "nas.lan" });
+    expect(cnameResult.section).toBe("cfg0a3b5c");
+
+    expect(client.calls.filter((c) => c.method === "uciAddAnonymousSection")).toHaveLength(2);
+  });
+
+  it("set_dhcp_range ensures the dhcp section exists before setting options", async () => {
+    const tool = findTool(dnsTools, "openwrt_dns_set_dhcp_range");
+    await tool.handler(client, { interface: "guest", start: 100, limit: 50, leasetime: "12h" });
+
+    const ensureCall = client.calls.find((c) => c.method === "uciAddSection");
+    expect(ensureCall!.args).toEqual(["dhcp", "guest", "dhcp", { allowExisting: true }]);
+    const firstSet = client.calls.findIndex((c) => c.method === "uciSet");
+    expect(client.calls.indexOf(ensureCall!)).toBeLessThan(firstSet);
+  });
+
   it("set_upstream_servers reverts staged changes on failure", async () => {
     (client as any).executeCommand = vi.fn(async (cmd: string) => {
       client.calls.push({ method: "executeCommand", args: [cmd] });
@@ -736,6 +961,16 @@ describe("Network tools", () => {
       tool.handler(client, { interface: "a b" })
     ).rejects.toThrow("Invalid interface name");
   });
+
+  it("set_dhcp reverts staged changes when commit fails", async () => {
+    (client as any).uciCommit = vi.fn(async () => {
+      throw new Error("uci: I/O error");
+    });
+    const tool = findTool(networkTools, "openwrt_network_set_dhcp");
+    await expect(tool.handler(client, { interface: "wan" })).rejects.toThrow("I/O error");
+    expect(client.calls.some((c) => c.method === "uciRevert" && c.args[0] === "network")).toBe(true);
+    expect(client.calls.some((c) => c.method === "reloadNetwork")).toBe(false);
+  });
 });
 
 describe("Script tools", () => {
@@ -776,6 +1011,16 @@ describe("Script tools", () => {
     );
     expect(execCall).toBeDefined();
     expect(execCall!.args[0]).toBe("nohup '/root/test.sh' >/dev/null 2>&1 &");
+  });
+
+  it("script_execute passes timeout_ms through", async () => {
+    const tool = findTool(scriptTools, "openwrt_script_execute");
+    await tool.handler(client, { path: "/root/slow.sh", timeout_ms: 300_000 });
+
+    const execCall = client.calls.find(
+      (c) => c.method === "executeCommand" && c.args[0].includes("slow.sh")
+    );
+    expect(execCall!.args[1]).toEqual({ timeout: 300_000 });
   });
 
   it("script_list uses find instead of ls glob", async () => {

@@ -53,12 +53,21 @@ if (Number.isNaN(port) || port < 1 || port > 65535) {
   console.error(`Error: Invalid OPENWRT_PORT: ${JSON.stringify(process.env.OPENWRT_PORT)}`);
   process.exit(1);
 }
+let readyTimeout: number | undefined;
+if (process.env.OPENWRT_READY_TIMEOUT !== undefined) {
+  readyTimeout = parseInt(process.env.OPENWRT_READY_TIMEOUT, 10);
+  if (Number.isNaN(readyTimeout) || readyTimeout < 1) {
+    console.error(`Error: Invalid OPENWRT_READY_TIMEOUT: ${JSON.stringify(process.env.OPENWRT_READY_TIMEOUT)}`);
+    process.exit(1);
+  }
+}
 const config = {
   host: process.env.OPENWRT_HOST || "192.168.1.1",
   port,
   username: process.env.OPENWRT_USERNAME || "root",
   password: process.env.OPENWRT_PASSWORD,
   privateKey,
+  readyTimeout,
 };
 
 // Validate configuration
@@ -74,7 +83,7 @@ const openwrtClient = new OpenWRTClient(config);
 const server = new Server(
   {
     name: "openwrt-mcp-server",
-    version: "2.0.0",
+    version: "2.1.0",
   },
   {
     capabilities: {

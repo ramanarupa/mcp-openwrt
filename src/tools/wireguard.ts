@@ -1,6 +1,14 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateUciSectionName, extractWireguardConfig } from "../utils.js";
+import { shellQuote, validateUciSectionName, extractWireguardConfig, validateWgKey } from "../utils.js";
+
+/**
+ * Derive the public key without putting the private key on a command line
+ * (it would be visible in `ps` on the router): feed it to `wg pubkey` via stdin.
+ */
+async function derivePublicKey(client: OpenWRTClient, privateKey: string): Promise<string> {
+  return (await client.executeCommand("wg pubkey", { stdin: privateKey + "\n" })).trim();
+}
 
 export const wireguardTools: Tool[] = [
   {
@@ -61,16 +69,17 @@ export const wireguardTools: Tool[] = [
       validateUciSectionName(name, "interface name");
 
       // Generate private key if not provided
-      let privateKey = private_key;
-      if (!privateKey) {
-        privateKey = (await client.executeCommand("wg genkey")).trim();
-      }
+      const privateKey = validateWgKey(
+        private_key ? private_key : (await client.executeCommand("wg genkey")).trim(),
+        "private_key"
+      );
 
       try {
         // Create interface section
         await client.uciAddSection("network", name, "interface");
         await client.uciSet("network", name, "proto", "wireguard");
-        await client.uciSet("network", name, "private_key", privateKey);
+        // Secret: goes through `uci batch` stdin, never the command line
+        await client.uciSetSecret("network", name, "private_key", privateKey);
         await client.uciSet("network", name, "listen_port", listen_port.toString());
 
         // Add IP addresses
@@ -88,9 +97,7 @@ export const wireguardTools: Tool[] = [
       await client.reloadNetwork();
 
       // Get public key
-      const publicKey = (
-        await client.executeCommand(`echo ${shellQuote(privateKey)} | wg pubkey`)
-      ).trim();
+      const publicKey = await derivePublicKey(client, privateKey);
 
       return {
         success: true,
@@ -155,6 +162,8 @@ export const wireguardTools: Tool[] = [
 
       validateUciSectionName(iface, "interface name");
       validateUciSectionName(peer_name, "peer name");
+      validateWgKey(public_key, "public_key");
+      if (preshared_key) validateWgKey(preshared_key, "preshared_key");
 
       // Create peer section
       const peerSection = `${iface}_${peer_name}`;
@@ -191,7 +200,8 @@ export const wireguardTools: Tool[] = [
         }
 
         if (preshared_key) {
-          await client.uciSet("network", peerSection, "preshared_key", preshared_key);
+          // Secret: goes through `uci batch` stdin, never the command line
+          await client.uciSetSecret("network", peerSection, "preshared_key", preshared_key);
         }
 
         // Commit and reload
@@ -262,10 +272,8 @@ export const wireguardTools: Tool[] = [
       properties: {},
     },
     handler: async (client: OpenWRTClient) => {
-      const privateKey = (await client.executeCommand("wg genkey")).trim();
-      const publicKey = (
-        await client.executeCommand(`echo ${shellQuote(privateKey)} | wg pubkey`)
-      ).trim();
+      const privateKey = validateWgKey((await client.executeCommand("wg genkey")).trim(), "generated key");
+      const publicKey = await derivePublicKey(client, privateKey);
 
       return {
         success: true,

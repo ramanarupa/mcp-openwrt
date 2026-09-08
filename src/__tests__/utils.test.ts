@@ -5,6 +5,9 @@ import {
   validateUciSectionName,
   validateMode,
   extractWireguardConfig,
+  validateUciSectionRef,
+  validateWgKey,
+  assertSafeBackupDestination,
 } from "../utils.js";
 
 describe("shellQuote", () => {
@@ -218,5 +221,51 @@ describe("extractWireguardConfig", () => {
 
   it("returns empty string when no WireGuard config exists", () => {
     expect(extractWireguardConfig("network.lan=interface\nnetwork.lan.proto='static'")).toBe("");
+  });
+});
+
+describe("validateUciSectionRef", () => {
+  it("accepts named sections and anonymous references", () => {
+    expect(() => validateUciSectionRef("lan", "s")).not.toThrow();
+    expect(() => validateUciSectionRef("wg_vps_peer1", "s")).not.toThrow();
+    expect(() => validateUciSectionRef("@dnsmasq[0]", "s")).not.toThrow();
+    expect(() => validateUciSectionRef("@rule[-1]", "s")).not.toThrow();
+  });
+
+  it("rejects hyphens, dots, spaces and shell metacharacters", () => {
+    for (const bad of ["my-host", "a.b", "a b", "lan;id", "@dnsmasq", "@dnsmasq[x]", ""]) {
+      expect(() => validateUciSectionRef(bad, "s")).toThrow("Invalid s");
+    }
+  });
+});
+
+describe("validateWgKey", () => {
+  const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+  it("returns a well-formed key unchanged", () => {
+    expect(validateWgKey(key, "k")).toBe(key);
+    expect(validateWgKey("abc+/0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZab=", "k")).toBeTruthy();
+  });
+
+  it("rejects malformed keys", () => {
+    for (const bad of ["", "short", key.slice(0, 43), key + "=", key.replace("=", "!"), "x\n" + key, 42]) {
+      expect(() => validateWgKey(bad as any, "private_key")).toThrow("Invalid private_key");
+    }
+  });
+});
+
+describe("assertSafeBackupDestination", () => {
+  it("allows /root/backups and /tmp", () => {
+    expect(() => assertSafeBackupDestination("/root/backups/etc/dnsmasq.d/x.conf.backup-1")).not.toThrow();
+    expect(() => assertSafeBackupDestination("/tmp/network.bak")).not.toThrow();
+    expect(() => assertSafeBackupDestination("/etc/config.bak")).not.toThrow();
+  });
+
+  it("refuses wholesale-read directories", () => {
+    expect(() => assertSafeBackupDestination("/etc/dnsmasq.d/x.conf.bak")).toThrow("/etc/dnsmasq.d");
+    expect(() => assertSafeBackupDestination("/etc/config/network.bak")).toThrow("/etc/config");
+    expect(() => assertSafeBackupDestination("/etc/init.d/foo.bak")).toThrow("/etc/init.d");
+    expect(() => assertSafeBackupDestination("/etc/hotplug.d/iface/99-x.bak")).toThrow("/etc/hotplug.d");
+    expect(() => assertSafeBackupDestination("/etc/crontabs/root.bak")).toThrow("/etc/crontabs");
   });
 });

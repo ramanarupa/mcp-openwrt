@@ -1,11 +1,16 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateName } from "../utils.js";
+import { shellQuote, validateName, validateInt } from "../utils.js";
 
 const VALID_SERVICE_ACTIONS = ["start", "stop", "restart", "reload", "enable", "disable", "status"] as const;
 
 // apk over a slow uplink can easily exceed the default 30s command timeout
 const PACKAGE_TIMEOUT = 120_000;
+// network/firewall/dnsmasq restarts regularly overrun 30s on a busy router
+const SERVICE_TIMEOUT = 90_000;
+// Bounds for the caller-supplied execute_command timeout
+const MIN_EXEC_TIMEOUT = 1_000;
+const MAX_EXEC_TIMEOUT = 600_000;
 
 export const systemTools: Tool[] = [
   {
@@ -40,7 +45,8 @@ export const systemTools: Tool[] = [
   },
   {
     name: "openwrt_system_execute_command",
-    description: "Execute a shell command on the OpenWRT device. WARNING: This runs arbitrary commands — use with caution. Set confirm to true to proceed.",
+    description:
+      "Execute a shell command on the OpenWRT device and return exit_code, stdout and stderr. A non-zero exit code is reported, not thrown, so the output is never lost. Default timeout 30s; raise timeout_ms for slow commands (the remote process keeps running if the timeout fires). WARNING: runs arbitrary commands — set confirm to true to proceed.",
     inputSchema: {
       type: "object",
       properties: {
@@ -52,11 +58,15 @@ export const systemTools: Tool[] = [
           type: "boolean",
           description: "Must be set to true to confirm execution",
         },
+        timeout_ms: {
+          type: "number",
+          description: "Command timeout in milliseconds (default 30000, min 1000, max 600000)",
+        },
       },
       required: ["command", "confirm"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
-      const { command, confirm } = args;
+      const { command, confirm, timeout_ms } = args;
 
       if (!confirm) {
         return {
@@ -65,10 +75,15 @@ export const systemTools: Tool[] = [
         };
       }
 
-      const output = await client.executeCommand(command);
+      const timeout =
+        timeout_ms === undefined ? undefined : validateInt(timeout_ms, "timeout_ms", MIN_EXEC_TIMEOUT, MAX_EXEC_TIMEOUT);
+
+      const result = await client.executeCommandRaw(command, { timeout });
       return {
-        success: true,
-        output,
+        success: result.code === 0,
+        exit_code: result.code,
+        output: result.stdout,
+        stderr: result.stderr,
       };
     },
   },
@@ -210,7 +225,8 @@ export const systemTools: Tool[] = [
   },
   {
     name: "openwrt_service_control",
-    description: "Control a service (start, stop, restart, enable, disable)",
+    description:
+      "Control a service (start, stop, restart, reload, enable, disable, status). Start/stop/restart/reload get a 90s timeout; the service keeps (re)starting on the router even if the call times out.",
     inputSchema: {
       type: "object",
       properties: {
@@ -236,10 +252,20 @@ export const systemTools: Tool[] = [
 
       // `status` exits non-zero (e.g. 3) for stopped procd services — that's a
       // report, not a failure. Merge stderr and mask the exit code for it.
-      const command = action === "status"
-        ? `/etc/init.d/${service} status 2>&1 || true`
-        : `/etc/init.d/${service} ${action}`;
-      const output = await client.executeCommand(command);
+      if (action === "status") {
+        const output = await client.executeCommand(`/etc/init.d/${service} status 2>&1 || true`);
+        return {
+          success: true,
+          message: `Service ${service} ${action} executed`,
+          output,
+        };
+      }
+
+      const slow = action === "start" || action === "stop" || action === "restart" || action === "reload";
+      const output = await client.executeCommand(
+        `/etc/init.d/${service} ${action}`,
+        slow ? { timeout: SERVICE_TIMEOUT } : {}
+      );
       return {
         success: true,
         message: `Service ${service} ${action} executed`,
@@ -300,7 +326,7 @@ export const systemTools: Tool[] = [
         success: true,
         message: "Configuration backup created",
         backup_path: backupPath,
-        note: "Backup saved on router. Use file_read or scp to retrieve it.",
+        note: "Backup saved on router in /tmp (lost on reboot). Use file_read or scp to retrieve it.",
       };
     },
   },

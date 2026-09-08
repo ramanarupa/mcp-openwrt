@@ -1,6 +1,6 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateName, validateAbsolutePath, shellEscape } from "../utils.js";
+import { shellQuote, validateName, validateAbsolutePath, shellEscape, validateInt } from "../utils.js";
 
 export const scriptTools: Tool[] = [
   {
@@ -84,11 +84,17 @@ export const scriptTools: Tool[] = [
           type: "boolean",
           description: "Run in background (default: false)",
         },
+        timeout_ms: {
+          type: "number",
+          description: "Timeout in milliseconds for foreground runs (default 30000, max 600000)",
+        },
       },
       required: ["path"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
-      const { path, args: scriptArgs = "", background = false } = args;
+      const { path, args: scriptArgs = "", background = false, timeout_ms } = args;
+      const timeout =
+        timeout_ms === undefined ? undefined : validateInt(timeout_ms, "timeout_ms", 1_000, 600_000);
 
       // path is quoted; scriptArgs is intentionally raw (user-supplied shell args)
       const argsSuffix = scriptArgs ? ` ${scriptArgs}` : "";
@@ -97,7 +103,7 @@ export const scriptTools: Tool[] = [
       const command = background
         ? `nohup ${shellQuote(path)}${argsSuffix} >/dev/null 2>&1 &`
         : `${shellQuote(path)}${argsSuffix}`;
-      const output = await client.executeCommand(command);
+      const output = await client.executeCommand(command, { timeout });
 
       return {
         success: true,

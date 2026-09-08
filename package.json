@@ -1,6 +1,6 @@
 {
   "name": "openwrt-mcp-server",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "MCP Server for OpenWRT configuration via Claude Code",
   "main": "build/index.js",
   "type": "module",
@@ -22,14 +22,17 @@
   ],
   "author": "Rustam Gaifiev <rgaifiev@gmail.com>",
   "license": "MIT",
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "ssh2": "^1.17.0"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "@types/ssh2": "^1.15.5",
-    "typescript": "^5.9.3",
-    "vitest": "^4.1.0"
+    "@types/node": "^26.5.0",
+    "@types/ssh2": "^1.15.6",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.0"
   }
 }

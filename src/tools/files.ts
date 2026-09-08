@@ -1,11 +1,29 @@
 import { OpenWRTClient } from "../openwrt-client.js";
 import { Tool } from "../types.js";
-import { shellQuote, validateMode } from "../utils.js";
+import {
+  shellQuote,
+  validateMode,
+  validateInt,
+  validateAbsolutePath,
+  assertSafeBackupDestination,
+} from "../utils.js";
+
+/** Default cap for file_read so a log or archive cannot flood the context. */
+const DEFAULT_READ_LIMIT = 256 * 1024;
+const MAX_READ_LIMIT = 16 * 1024 * 1024;
+/** Where file_backup puts copies unless told otherwise (survives reboot, not sysupgrade). */
+const BACKUP_ROOT = "/root/backups";
+
+function dirname(path: string): string {
+  const idx = path.lastIndexOf("/");
+  return idx <= 0 ? "/" : path.slice(0, idx);
+}
 
 export const fileTools: Tool[] = [
   {
     name: "openwrt_file_read",
-    description: "Read any file from the OpenWRT filesystem",
+    description:
+      "Read a file from the OpenWRT filesystem. Output is capped at max_bytes (default 256 KiB); the response reports the real size and whether it was truncated. Use tail_lines to read only the end of a log.",
     inputSchema: {
       type: "object",
       properties: {
@@ -13,22 +31,59 @@ export const fileTools: Tool[] = [
           type: "string",
           description: "Full path to the file (e.g., '/etc/config/network', '/root/script.sh')",
         },
+        max_bytes: {
+          type: "number",
+          description: "Maximum number of bytes to return (default 262144, max 16777216)",
+        },
+        tail_lines: {
+          type: "number",
+          description: "Return only the last N lines (like `tail -n N`). Ignores max_bytes.",
+        },
       },
       required: ["path"],
     },
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
-      const { path } = args;
-      const content = await client.readFile(path);
+      const { path, max_bytes, tail_lines } = args;
+
+      if (tail_lines !== undefined) {
+        const n = validateInt(tail_lines, "tail_lines", 1, 1_000_000);
+        const content = await client.executeCommand(`tail -n ${n} ${shellQuote(path)}`);
+        return {
+          success: true,
+          path,
+          tail_lines: n,
+          content,
+        };
+      }
+
+      const limit =
+        max_bytes === undefined ? DEFAULT_READ_LIMIT : validateInt(max_bytes, "max_bytes", 1, MAX_READ_LIMIT);
+      const { content, size, truncated } = await client.readFileLimited(path, limit);
+
+      if (content.includes("\u0000")) {
+        return {
+          success: true,
+          path,
+          size,
+          binary: true,
+          message: "File contains NUL bytes (binary); content omitted. Use openwrt_system_execute_command with base64/hexdump if you need it.",
+        };
+      }
+
       return {
         success: true,
         path,
+        size,
+        truncated,
+        ...(truncated ? { message: `Showing first ${limit} of ${size} bytes; raise max_bytes or use tail_lines` } : {}),
         content,
       };
     },
   },
   {
     name: "openwrt_file_write",
-    description: "Write content to a file on the OpenWRT filesystem",
+    description:
+      "Write content to a file on the OpenWRT filesystem byte-for-byte (no newline is added). The on-disk size is verified against the payload and returned as bytes_written.",
     inputSchema: {
       type: "object",
       properties: {
@@ -38,7 +93,7 @@ export const fileTools: Tool[] = [
         },
         content: {
           type: "string",
-          description: "Content to write to the file",
+          description: "Content to write to the file (include a trailing newline yourself if the file needs one)",
         },
         mode: {
           type: "string",
@@ -50,10 +105,13 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, content, mode } = args;
 
-      await client.writeFile(path, content);
-
       if (mode) {
         validateMode(mode);
+      }
+
+      const bytesWritten = await client.writeFile(path, content);
+
+      if (mode) {
         await client.executeCommand(`chmod ${mode} ${shellQuote(path)}`);
       }
 
@@ -61,12 +119,14 @@ export const fileTools: Tool[] = [
         success: true,
         message: `File written successfully: ${path}`,
         path,
+        bytes_written: bytesWritten,
+        ends_with_newline: content.endsWith("\n"),
       };
     },
   },
   {
     name: "openwrt_file_append",
-    description: "Append content to an existing file",
+    description: "Append content to an existing file byte-for-byte; the size change is verified.",
     inputSchema: {
       type: "object",
       properties: {
@@ -84,13 +144,13 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, content } = args;
 
-      // Content is streamed to stdin so it is appended byte-for-byte
-      // (a heredoc would force an extra trailing newline)
-      await client.executeCommand(`cat >> ${shellQuote(path)}`, { stdin: content });
+      const size = await client.appendFile(path, content);
 
       return {
         success: true,
         message: `Content appended to ${path}`,
+        bytes_appended: Buffer.byteLength(content, "utf8"),
+        size,
       };
     },
   },
@@ -245,7 +305,8 @@ export const fileTools: Tool[] = [
   },
   {
     name: "openwrt_file_backup",
-    description: "Create a backup of a file or directory",
+    description:
+      `Create a backup copy of a file or directory. By default the copy goes under ${BACKUP_ROOT}/<original path>.backup-<timestamp>, never next to the original: directories such as /etc/dnsmasq.d, /etc/config or /etc/init.d load every file they contain, so an in-place .bak would take effect as config. Explicit backup_path values inside such directories are rejected.`,
     inputSchema: {
       type: "object",
       properties: {
@@ -255,7 +316,7 @@ export const fileTools: Tool[] = [
         },
         backup_path: {
           type: "string",
-          description: "Backup destination (optional, defaults to path.backup with timestamp)",
+          description: `Backup destination (optional, defaults to ${BACKUP_ROOT}/<path>.backup-<timestamp>)`,
         },
       },
       required: ["path"],
@@ -263,15 +324,21 @@ export const fileTools: Tool[] = [
     handler: async (client: OpenWRTClient, args: Record<string, any>) => {
       const { path, backup_path } = args;
 
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const destination = backup_path || `${path}.backup-${timestamp}`;
+      validateAbsolutePath(path, "path");
 
+      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+      const destination: string = backup_path || `${BACKUP_ROOT}${path}.backup-${timestamp}`;
+      validateAbsolutePath(destination, "backup_path");
+      assertSafeBackupDestination(destination);
+
+      await client.executeCommand(`mkdir -p ${shellQuote(dirname(destination))}`);
       await client.executeCommand(`cp -r ${shellQuote(path)} ${shellQuote(destination)}`);
 
       return {
         success: true,
         message: `Backup created: ${destination}`,
         backup_path: destination,
+        note: `${BACKUP_ROOT} survives reboot but not sysupgrade; copy elsewhere if you need it longer.`,
       };
     },
   },

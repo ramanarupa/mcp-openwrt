@@ -61,7 +61,8 @@ npm run build
 - `OPENWRT_HOST` - IP адрес вашего OpenWRT роутера (например, 192.168.1.1)
 - `OPENWRT_PORT` - SSH порт (обычно 22)
 - `OPENWRT_USERNAME` - имя пользователя (обычно root)
-- `OPENWRT_PASSWORD` - ваш пароль от роутера
+- `OPENWRT_PASSWORD` - ваш пароль от роутера (может быть пустой строкой, если пароль ещё не задан)
+- `OPENWRT_READY_TIMEOUT` - таймаут SSH-рукопожатия в мс (по умолчанию 30000; увеличьте для медленных каналов, необязательно)
 
 ## Шаг 3: Использование
 
@@ -146,7 +147,8 @@ C:\Users\ВашеИмя\AppData\Roaming\Claude\claude_desktop_config.json
 - `OPENWRT_HOST` - IP адрес вашего OpenWRT роутера (например, 192.168.1.1)
 - `OPENWRT_PORT` - SSH порт (обычно 22)
 - `OPENWRT_USERNAME` - имя пользователя (обычно root)
-- `OPENWRT_PASSWORD` - ваш пароль от роутера
+- `OPENWRT_PASSWORD` - ваш пароль от роутера (может быть пустой строкой, если пароль ещё не задан)
+- `OPENWRT_READY_TIMEOUT` - таймаут SSH-рукопожатия в мс (по умолчанию 30000; увеличьте для медленных каналов, необязательно)
 
 ## Шаг 4: Перезапустите Claude Desktop
 

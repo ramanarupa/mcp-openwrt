@@ -1,7 +1,11 @@
 import { Client, ClientChannel } from "ssh2";
-import { shellQuote, validateName } from "./utils.js";
+import { StringDecoder } from "node:string_decoder";
+import { shellQuote, validateName, validateUciSectionRef } from "./utils.js";
 
 const DEFAULT_COMMAND_TIMEOUT = 30_000; // 30 seconds
+const DEFAULT_READY_TIMEOUT = 30_000; // SSH handshake timeout (was 10s — too short over slow/laggy links)
+/** Max bytes of stdout embedded into a "command failed" error message. */
+const ERROR_STDOUT_LIMIT = 4_000;
 
 export interface OpenWRTConfig {
   host: string;
@@ -9,6 +13,8 @@ export interface OpenWRTConfig {
   username: string;
   password?: string;
   privateKey?: string;
+  /** SSH handshake (ready) timeout in ms. Default 30s. Raise for slow uplinks. */
+  readyTimeout?: number;
 }
 
 export interface ExecuteOptions {
@@ -16,6 +22,22 @@ export interface ExecuteOptions {
   timeout?: number;
   /** If set, this string is streamed to the command's stdin and the channel is closed (EOF). */
   stdin?: string;
+}
+
+/** Result of a command that ran to completion (any exit code). */
+export interface CommandResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** Result of a size-capped file read. */
+export interface LimitedFileContent {
+  content: string;
+  /** Actual size of the file on disk, in bytes. */
+  size: number;
+  /** True when `content` holds fewer bytes than the file. */
+  truncated: boolean;
 }
 
 export class OpenWRTClient {
@@ -73,7 +95,7 @@ export class OpenWRTClient {
           privateKey: this.config.privateKey,
           keepaliveInterval: 15_000,
           keepaliveCountMax: 3,
-          readyTimeout: 10_000,
+          readyTimeout: this.config.readyTimeout ?? DEFAULT_READY_TIMEOUT,
         });
     });
   }
@@ -92,7 +114,15 @@ export class OpenWRTClient {
     }
   }
 
-  async executeCommand(command: string, options: ExecuteOptions = {}): Promise<string> {
+  /**
+   * Run a command and return its exit code plus full stdout/stderr, without
+   * treating a non-zero exit as an error. Rejects only when the command could
+   * not be run to completion (timeout, dropped channel, exec failure).
+   *
+   * Output is decoded with StringDecoder so multi-byte UTF-8 characters that
+   * straddle an SSH packet boundary are not mangled into U+FFFD.
+   */
+  async executeCommandRaw(command: string, options: ExecuteOptions = {}): Promise<CommandResult> {
     const { timeout = DEFAULT_COMMAND_TIMEOUT, stdin } = options;
     await this.ensureConnected();
 
@@ -106,7 +136,11 @@ export class OpenWRTClient {
           if (activeStream) {
             activeStream.close();
           }
-          reject(new Error(`Command timed out after ${timeout}ms: ${command.slice(0, 100)}`));
+          reject(
+            new Error(
+              `Command timed out after ${timeout}ms (the remote process may still be running): ${command.slice(0, 100)}`
+            )
+          );
         }
       }, timeout);
 
@@ -125,6 +159,8 @@ export class OpenWRTClient {
         }
 
         activeStream = stream;
+        const stdoutDecoder = new StringDecoder("utf8");
+        const stderrDecoder = new StringDecoder("utf8");
         let stdout = "";
         let stderr = "";
 
@@ -133,9 +169,9 @@ export class OpenWRTClient {
             if (!settled) {
               settled = true;
               clearTimeout(timer);
-              if (code === 0) {
-                resolve(stdout);
-              } else if (code === null || code === undefined) {
+              stdout += stdoutDecoder.end();
+              stderr += stderrDecoder.end();
+              if (code === null || code === undefined) {
                 // Channel closed without an exit status — usually a dropped connection
                 this.connected = false;
                 reject(
@@ -144,15 +180,15 @@ export class OpenWRTClient {
                   )
                 );
               } else {
-                reject(new Error(`Command failed with code ${code}: ${stderr}`));
+                resolve({ code, stdout, stderr });
               }
             }
           })
           .on("data", (data: Buffer) => {
-            stdout += data.toString();
+            stdout += stdoutDecoder.write(data);
           })
           .stderr.on("data", (data: Buffer) => {
-            stderr += data.toString();
+            stderr += stderrDecoder.write(data);
           });
 
         // Stream stdin content and signal EOF so commands like `cat > file` terminate
@@ -161,6 +197,19 @@ export class OpenWRTClient {
         }
       });
     });
+  }
+
+  /**
+   * Run a command and return stdout. A non-zero exit code is an error whose
+   * message carries both stderr and (truncated) stdout, so callers never lose
+   * the output of a partially successful script.
+   */
+  async executeCommand(command: string, options: ExecuteOptions = {}): Promise<string> {
+    const result = await this.executeCommandRaw(command, options);
+    if (result.code !== 0) {
+      throw new Error(formatCommandFailure(result));
+    }
+    return result.stdout;
   }
 
   /**
@@ -195,12 +244,25 @@ export class OpenWRTClient {
    * @param option - option name (optional)
    */
   async uciGet(config: string, section: string, option?: string): Promise<string> {
+    validateName(config, "UCI config name");
+    validateUciSectionRef(section, "UCI section");
+    if (option !== undefined) validateName(option, "UCI option name");
     const path = option
       ? `${config}.${section}.${option}`
       : `${config}.${section}`;
 
     const command = `uci get ${path}`;
     return (await this.executeCommand(command)).trim();
+  }
+
+  /**
+   * Return the type of a UCI section, or null when it does not exist.
+   */
+  async uciSectionType(config: string, section: string): Promise<string | null> {
+    validateName(config, "UCI config name");
+    validateUciSectionRef(section, "UCI section");
+    const result = await this.executeCommandRaw(`uci -q get ${config}.${section}`);
+    return result.code === 0 ? result.stdout.trim() : null;
   }
 
   /**
@@ -211,9 +273,38 @@ export class OpenWRTClient {
    * @param value - value to set
    */
   async uciSet(config: string, section: string, option: string, value: string): Promise<void> {
+    validateName(config, "UCI config name");
+    validateUciSectionRef(section, "UCI section");
+    validateName(option, "UCI option name");
     const path = `${config}.${section}.${option}`;
     const command = `uci set ${path}=${shellQuote(value)}`;
     await this.executeCommand(command);
+  }
+
+  /**
+   * Set a UCI option whose value must never appear on a command line
+   * (WireGuard private/preshared keys show up in `ps` otherwise). The
+   * assignment is fed to `uci batch` via stdin instead.
+   *
+   * `uci batch` does not stop on a failing line and may exit 0 regardless,
+   * so any stderr output is treated as failure.
+   */
+  async uciSetSecret(config: string, section: string, option: string, value: string): Promise<void> {
+    validateName(config, "UCI config name");
+    validateUciSectionRef(section, "UCI section");
+    validateName(option, "UCI option name");
+    // A newline would inject a second batch command; quotes/backslashes would
+    // be re-interpreted by uci's tokenizer. Secrets we handle (WG keys) are
+    // base64 and never contain these.
+    if (value.length === 0 || /[\s'"\\]/.test(value)) {
+      throw new Error(`Invalid value for ${config}.${section}.${option}: must be non-empty without whitespace, quotes or backslashes`);
+    }
+    const result = await this.executeCommandRaw("uci batch", {
+      stdin: `set ${config}.${section}.${option}=${value}\n`,
+    });
+    if (result.code !== 0 || result.stderr.trim().length > 0) {
+      throw new Error(`uci batch failed for ${config}.${section}.${option}: ${result.stderr.trim() || `exit code ${result.code}`}`);
+    }
   }
 
   /**
@@ -221,6 +312,7 @@ export class OpenWRTClient {
    * @param config - config name (optional, commits all if not specified)
    */
   async uciCommit(config?: string): Promise<void> {
+    if (config !== undefined) validateName(config, "UCI config name");
     const command = config ? `uci commit ${config}` : "uci commit";
     await this.executeCommand(command);
   }
@@ -230,6 +322,7 @@ export class OpenWRTClient {
    * @param config - config name (optional, reverts all if not specified)
    */
   async uciRevert(config?: string): Promise<void> {
+    if (config !== undefined) validateName(config, "UCI config name");
     const command = config ? `uci revert ${config}` : "uci revert";
     await this.executeCommand(command);
   }
@@ -252,19 +345,59 @@ export class OpenWRTClient {
    * Get all UCI configuration sections of a specific type
    */
   async uciShow(config: string): Promise<string> {
+    validateName(config, "UCI config name");
     const command = `uci show ${config}`;
     return await this.executeCommand(command);
   }
 
   /**
-   * Add a new UCI section
+   * Add a new named UCI section.
+   *
+   * `uci set config.section=type` silently re-types an existing section, so
+   * this checks first: an existing section is an error unless
+   * `allowExisting` is set and the type matches (idempotent "ensure").
+   *
    * @param config - config name (e.g., "network")
    * @param section - section name
    * @param type - section type (e.g., "route", "interface")
    */
-  async uciAddSection(config: string, section: string, type: string): Promise<void> {
+  async uciAddSection(
+    config: string,
+    section: string,
+    type: string,
+    options: { allowExisting?: boolean } = {}
+  ): Promise<void> {
+    validateName(config, "UCI config name");
+    validateUciSectionRef(section, "UCI section");
+    validateName(type, "UCI section type");
+
+    const existing = await this.uciSectionType(config, section);
+    if (existing !== null) {
+      if (options.allowExisting && existing === type) {
+        return;
+      }
+      throw new Error(
+        `UCI section ${config}.${section} already exists (type '${existing}'); refusing to overwrite it`
+      );
+    }
+
     const command = `uci set ${config}.${section}=${type}`;
     await this.executeCommand(command);
+  }
+
+  /**
+   * Add an anonymous UCI section (`uci add config type`) and return the
+   * generated section id (e.g. "cfg0a3b5c"). Use this when the caller has no
+   * natural section name — e.g. DHCP hosts whose hostnames contain hyphens.
+   */
+  async uciAddAnonymousSection(config: string, type: string): Promise<string> {
+    validateName(config, "UCI config name");
+    validateName(type, "UCI section type");
+    const id = (await this.executeCommand(`uci add ${config} ${type}`)).trim();
+    if (!/^[A-Za-z0-9_]+$/.test(id)) {
+      throw new Error(`Unexpected output from 'uci add ${config} ${type}': ${JSON.stringify(id)}`);
+    }
+    return id;
   }
 
   /**
@@ -277,13 +410,84 @@ export class OpenWRTClient {
   }
 
   /**
+   * Read at most `maxBytes` of a file and report its real size, so a large
+   * log or archive cannot flood the caller's context unnoticed.
+   */
+  async readFileLimited(path: string, maxBytes: number): Promise<LimitedFileContent> {
+    const quoted = shellQuote(path);
+    // First line: size in bytes; the rest: the (possibly truncated) content.
+    const output = await this.executeCommand(
+      `wc -c < ${quoted} && head -c ${maxBytes} ${quoted}`
+    );
+    const nl = output.indexOf("\n");
+    const sizeText = (nl === -1 ? output : output.slice(0, nl)).trim();
+    const size = Number(sizeText);
+    if (nl === -1 || !Number.isInteger(size)) {
+      throw new Error(`Unexpected output while reading ${path}: ${output.slice(0, 100)}`);
+    }
+    return {
+      content: output.slice(nl + 1),
+      size,
+      truncated: size > maxBytes,
+    };
+  }
+
+  /**
    * Write content to a file on the OpenWRT device.
    * Content is streamed to stdin of `cat`, so the file is written
    * byte-for-byte (a heredoc would force an extra trailing newline).
+   * The resulting file size is read back and compared with the payload so a
+   * dropped trailing newline or a short write surfaces immediately.
    * @param path - file path
    * @param content - content to write
+   * @returns number of bytes written
    */
-  async writeFile(path: string, content: string): Promise<void> {
-    await this.executeCommand(`cat > ${shellQuote(path)}`, { stdin: content });
+  async writeFile(path: string, content: string): Promise<number> {
+    const quoted = shellQuote(path);
+    const output = await this.executeCommand(`cat > ${quoted} && wc -c < ${quoted}`, { stdin: content });
+    return verifyWrittenSize(path, output, Buffer.byteLength(content, "utf8"));
   }
+
+  /**
+   * Append content to a file byte-for-byte and verify the size grew by
+   * exactly the payload length.
+   * @returns the file size after appending
+   */
+  async appendFile(path: string, content: string): Promise<number> {
+    const quoted = shellQuote(path);
+    const before = await this.executeCommandRaw(`wc -c < ${quoted}`);
+    const sizeBefore = before.code === 0 ? Number(before.stdout.trim()) : 0;
+    const output = await this.executeCommand(`cat >> ${quoted} && wc -c < ${quoted}`, { stdin: content });
+    return verifyWrittenSize(
+      path,
+      output,
+      (Number.isInteger(sizeBefore) ? sizeBefore : 0) + Buffer.byteLength(content, "utf8")
+    );
+  }
+}
+
+function verifyWrittenSize(path: string, wcOutput: string, expected: number): number {
+  const actual = Number(wcOutput.trim());
+  if (!Number.isInteger(actual)) {
+    throw new Error(`Could not verify write to ${path}: unexpected wc output ${JSON.stringify(wcOutput)}`);
+  }
+  if (actual !== expected) {
+    throw new Error(
+      `Write verification failed for ${path}: expected ${expected} bytes on disk, found ${actual}`
+    );
+  }
+  return actual;
+}
+
+function formatCommandFailure(result: CommandResult): string {
+  let message = `Command failed with code ${result.code}: ${result.stderr}`;
+  const stdout = result.stdout.trim();
+  if (stdout.length > 0) {
+    const shown =
+      stdout.length > ERROR_STDOUT_LIMIT
+        ? stdout.slice(0, ERROR_STDOUT_LIMIT) + `\n… (${stdout.length - ERROR_STDOUT_LIMIT} more chars)`
+        : stdout;
+    message += `\nstdout: ${shown}`;
+  }
+  return message;
 }
